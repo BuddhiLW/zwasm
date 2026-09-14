@@ -331,6 +331,7 @@ fn report(what: []const u8, err: anyerror) void {
 }
 
 pub fn main(init: std.process.Init) !void {
+    zwasm.support.dbg.initFromEnv(init.environ_map.get("ZWASM_DEBUG"));
     const io = init.io;
     const gpa = init.gpa;
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);

@@ -318,13 +318,20 @@ pub const P2Op = enum {
     // directly (error / pollable / terminal handles); all route to the
     // generic drop.
     io_resource_drop,
-    // wasi:filesystem/types stream-mint + metadata methods rust-std links
+    // wasi:filesystem/types stream-mint + get-flags methods rust-std links
     // but a CLI/TCP guest never calls — honest err(unsupported), the
-    // FILESYSTEM error-code ordinal (28).
+    // FILESYSTEM error-code ordinal (28). rust-std's fs::read / fs::write
+    // reach the via-stream pair, so a guest that reads or writes a file
+    // still fails here.
     fs_stub_via_stream_offset,
     fs_stub_via_stream,
     fs_stub_get_flags,
-    fs_stub_metadata_hash,
+    // wasi:filesystem/types metadata-hash + metadata-hash-at — wasi-libc fills
+    // st_ino / d_ino from them, so rust-std's fs::metadata, File::metadata and
+    // read_dir import BOTH; a world without the `-at` row fails to LINK, not
+    // to call. Real: a hash over the P1 filestat (shared with the 0.3 host).
+    fs_descriptor_metadata_hash,
+    fs_descriptor_metadata_hash_at,
     // wasi:sockets (ADR-0180 Phase 1) — TCP-client subset with REAL
     // implementations; everything else is an HONEST err(not-supported)
     // stub op shared by core-signature shape (the spec's typed signal for
@@ -455,7 +462,9 @@ pub fn p1Target(op: P2Op) P1Target {
         .fs_descriptor_read_directory, .fs_dir_entry_stream_read => .fd_readdir,
         .fs_dir_entry_stream_drop => .noop,
         .io_resource_drop => .noop,
-        .fs_stub_via_stream_offset, .fs_stub_via_stream, .fs_stub_get_flags, .fs_stub_metadata_hash => .noop,
+        .fs_stub_via_stream_offset, .fs_stub_via_stream, .fs_stub_get_flags => .noop,
+        .fs_descriptor_metadata_hash => .fd_filestat_get,
+        .fs_descriptor_metadata_hash_at => .path_filestat_get,
         // wasi:sockets — no P1 facility; the host backing is std.Io.net
         // (src/wasi/p2_sockets.zig), not a preview1 syscall.
         .sock_instance_network,
@@ -701,7 +710,8 @@ const table = [_]Entry{
     .{ .iface = "wasi:filesystem/types", .func = "[method]descriptor.write-via-stream", .op = .fs_stub_via_stream_offset, .gens = p2_only },
     .{ .iface = "wasi:filesystem/types", .func = "[method]descriptor.append-via-stream", .op = .fs_stub_via_stream, .gens = p2_only },
     .{ .iface = "wasi:filesystem/types", .func = "[method]descriptor.get-flags", .op = .fs_stub_get_flags, .gens = p2_only },
-    .{ .iface = "wasi:filesystem/types", .func = "[method]descriptor.metadata-hash", .op = .fs_stub_metadata_hash, .gens = p2_only },
+    .{ .iface = "wasi:filesystem/types", .func = "[method]descriptor.metadata-hash", .op = .fs_descriptor_metadata_hash, .gens = p2_only },
+    .{ .iface = "wasi:filesystem/types", .func = "[method]descriptor.metadata-hash-at", .op = .fs_descriptor_metadata_hash_at, .gens = p2_only },
     .{ .iface = "wasi:sockets/instance-network", .func = "instance-network", .op = .sock_instance_network },
     .{ .iface = "wasi:sockets/tcp-create-socket", .func = "create-tcp-socket", .op = .sock_create_tcp },
     .{ .iface = "wasi:sockets/tcp", .func = "[method]tcp-socket.start-bind", .op = .sock_tcp_start_bind },
@@ -935,6 +945,14 @@ test "classify: wasi:io/poll + subscribe methods" {
     try testing.expectEqual(P2Op.in_stream_subscribe, classifyImport("wasi:io/streams", "[method]input-stream.subscribe", .any).?);
     try testing.expectEqual(P2Op.clocks_subscribe_duration, classifyImport("wasi:clocks/monotonic-clock", "subscribe-duration", .any).?);
     try testing.expectEqual(P1Target.noop, p1Target(.poll_poll));
+}
+
+test "classify: 0.2 metadata-hash + metadata-hash-at are real P2 ops, distinct from the 0.3 rows" {
+    try testing.expectEqual(P2Op.fs_descriptor_metadata_hash, classifyImport("wasi:filesystem/types", "[method]descriptor.metadata-hash", .p2).?);
+    try testing.expectEqual(P2Op.fs_descriptor_metadata_hash_at, classifyImport("wasi:filesystem/types", "[method]descriptor.metadata-hash-at", .p2).?);
+    try testing.expectEqual(P2Op.fs3_metadata_hash_at, classifyImport("wasi:filesystem/types", "[method]descriptor.metadata-hash-at", .p3).?);
+    try testing.expectEqual(P1Target.fd_filestat_get, p1Target(.fs_descriptor_metadata_hash));
+    try testing.expectEqual(P1Target.path_filestat_get, p1Target(.fs_descriptor_metadata_hash_at));
 }
 
 test "classify: cli/environment + terminal + check-write (E2)" {

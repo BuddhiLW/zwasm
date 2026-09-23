@@ -22,8 +22,9 @@ rust-std writes files through `write-via-stream`, which the 0.2 host still
 stubs as unsupported. It stats `a.txt` by path and by fd and asserts the two
 routes report the same `st_ino` (one object, one identity: the path route
 reads `metadata-hash-at`, the fd route `metadata-hash`), stats the directory,
-asserts `NotFound` on a missing path, lists the directory, and prints
-`META-OK a.txt,b.txt`.
+asserts `NotFound` on a missing path, asserts that `fs::read` fails as
+`ErrorKind::Unsupported` (the `read-via-stream` stub's `error-code`, as the
+guest decodes it), lists the directory, and prints `META-OK a.txt,b.txt`.
 
 ## Build (gen host)
 

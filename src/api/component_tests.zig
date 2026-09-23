@@ -1084,8 +1084,9 @@ test "0.2 metadata-hash + metadata-hash-at: a rust-std wasip2 guest's fs::metada
     // `metadata-hash` (fstat), so the guest IMPORTS both; before the `-at`
     // row existed the whole world failed to link as UnsupportedWasiImport.
     // The guest asserts fs::metadata by path and by fd (the same st_ino from
-    // both routes), the preopen dir, NotFound on a missing path, and a sorted
-    // read_dir, then prints.
+    // both routes), the preopen dir, NotFound on a missing path, Unsupported
+    // from fs::read (the read-via-stream stub's error-code ordinal, as the
+    // guest decodes it), and a sorted read_dir, then prints.
     try runWasiP2Main(&eng, testing.allocator, bytes, &host, .{});
     try testing.expectEqualStrings("META-OK a.txt,b.txt\n", capture.items);
 }

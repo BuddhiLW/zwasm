@@ -4,7 +4,8 @@
 // `fs::metadata`, `File::metadata` and `fs::read_dir` imports them.
 // Expects a preopen at /work holding a.txt (5 bytes) and b.txt (1 byte),
 // created by the host: the guest never writes, because rust-std writes files
-// through `write-via-stream`, which the 0.2 host does not provide. Prints
+// through `write-via-stream`, which the 0.2 host does not provide. Its one
+// read (`read-via-stream`, also a stub) must fail as `Unsupported`. Prints
 // META-OK <sorted entries>.
 
 // `MetadataExt::ino` is unstable twice over on this target: `std::os::wasi`
@@ -32,6 +33,11 @@ fn main() {
 
     let missing = fs::metadata("/work/nope").expect_err("missing path must be an error");
     assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+
+    // Reading contents goes through `read-via-stream`, which the 0.2 host
+    // stubs as err(unsupported); the guest must see exactly that kind.
+    let unread = fs::read("/work/a.txt").expect_err("read-via-stream is a stub");
+    assert_eq!(unread.kind(), std::io::ErrorKind::Unsupported);
 
     let mut names: Vec<String> = fs::read_dir("/work")
         .expect("read_dir")

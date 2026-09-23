@@ -64,6 +64,18 @@ SemVer compatibility guarantees start at the first stable `v2.0.0` tag.
   file's contents still fails on the 0.2 path: rust-std does both through
   `read-via-stream` / `write-via-stream`, which stay err(unsupported) stubs.
 
+- **The 0.2 filesystem `error-code` ordinals past `no-lock` were one too
+  high.** `P2ErrorCode` named only the members the P1 errnos map onto, each
+  with a hand-written ordinal, and after `no-entry` (20) it left a gap of two
+  where `no-lock` takes one. `unsupported` lowered as 28, which is `no-tty` in
+  the WIT, so every err(unsupported) stub (the `*-via-stream` and `get-flags`
+  methods) reached a rust-std guest as ENOTTY "Not a tty" instead of ENOTSUP;
+  `not-directory`, `not-permitted`, `read-only` and the rest of the tail were
+  shifted the same way, so every 0.2 filesystem error past `no-lock` reached
+  the guest as its neighbour. The enum now declares all 37 members in WIT
+  order with no explicit values, so the ordinals cannot drift from the
+  declaration.
+
 ## [2.7.0] - 2026-09-14
 
 ### Added

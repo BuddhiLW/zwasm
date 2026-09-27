@@ -84,6 +84,23 @@ SemVer compatibility guarantees start at the first stable `v2.0.0` tag.
   import's instance-type decls. Before, the lowering host answered null and the
   type bridge `UnsupportedType`.
 
+- **A rust-std `wasm32-wasip2` component that touches the filesystem now
+  instantiates.** wasi-libc fills `st_ino` / `d_ino` from
+  `wasi:filesystem/types@0.2` `[method]descriptor.metadata-hash-at` (stat,
+  readdir) and `metadata-hash` (fstat), so `fs::metadata`, `File::metadata`
+  and `fs::read_dir` all import both. The 0.2 adapter table had a row for
+  `metadata-hash` (an err(unsupported) stub) and none for `metadata-hash-at`,
+  so the whole world failed to LINK with `UnsupportedWasiImport` before a
+  single guest instruction ran; a `println!`-only guest passed because it
+  never linked the filesystem interface. Both are now real: a hash over the
+  P1 filestat, the same derivation the 0.3 host already used, so one object
+  has one identity whichever generation the guest speaks. Fixtures:
+  `test/component/wasi_p2_fs_meta_rust.wasm` (the rust-std guest links and
+  runs) and `test/component/wasi_p2_fs_meta.wasm` (the fd route and the path
+  route hash one file to the same value). A guest that reads or writes a
+  file's contents still fails on the 0.2 path: rust-std does both through
+  `read-via-stream` / `write-via-stream`, which stay err(unsupported) stubs.
+
 - **The 0.2 filesystem `error-code` ordinals past `no-lock` were one too
   high.** `P2ErrorCode` named only the members the P1 errnos map onto, each
   with a hand-written ordinal, and after `no-entry` (20) it left a gap of two

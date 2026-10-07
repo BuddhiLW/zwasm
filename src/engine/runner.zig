@@ -1032,6 +1032,9 @@ pub const JitInstance = struct {
     /// gives C a thunk into A directly — link-time folding, nothing walked at
     /// call time.
     import_targets: []setup_mod.FuncImportTarget = &.{},
+    /// True when `compiled` is a by-value view of a `CompiledWasm` the caller
+    /// owns (`initLinkedShared`); `deinit` then leaves it alone.
+    compiled_borrowed: bool = false,
 
     pub fn init(allocator: Allocator, wasm_bytes: []const u8) Error!JitInstance {
         return initLinked(allocator, wasm_bytes, &.{}, &.{}, &.{}, &.{});
@@ -1061,6 +1064,26 @@ pub const JitInstance = struct {
         return .{ .compiled = compiled, .owned = owned, .wasm_bytes = wasm_bytes, .import_targets = import_targets };
     }
 
+    /// `initLinked` over a `CompiledWasm` compiled earlier from the same
+    /// `wasm_bytes` and still owned by the caller: only the per-instance setup
+    /// runs. The compiled code is read-only to setup and execution, so any
+    /// number of instances may share it, concurrently included. The caller
+    /// keeps `shared` alive until every instance built from it is deinit'd.
+    pub fn initLinkedShared(
+        allocator: Allocator,
+        shared: *const CompiledWasm,
+        wasm_bytes: []const u8,
+        imported_global_vals: []const u64,
+        func_import_targets: []const setup_mod.FuncImportTarget,
+        tag_import_targets: []const setup_mod.TagImportTarget,
+        host_func_targets: []const setup_mod.HostFuncTarget,
+    ) Error!JitInstance {
+        var owned = try setup_mod.setupRuntimeLinked(allocator, shared, wasm_bytes, imported_global_vals, func_import_targets, tag_import_targets, host_func_targets);
+        errdefer owned.deinit(allocator);
+        const import_targets = try allocator.dupe(setup_mod.FuncImportTarget, func_import_targets);
+        return .{ .compiled = shared.*, .owned = owned, .wasm_bytes = wasm_bytes, .import_targets = import_targets, .compiled_borrowed = true };
+    }
+
     /// ADR-0203 stage 2 — build a JitInstance from an ALREADY-BUILT
     /// `CompiledWasm` (the `.cwasm` full-fidelity load path: the
     /// deserializer rebuilds `compiled` and this runs the SAME setup a
@@ -1078,7 +1101,7 @@ pub const JitInstance = struct {
     pub fn deinit(self: *JitInstance, allocator: Allocator) void {
         if (self.import_targets.len > 0) allocator.free(self.import_targets);
         self.owned.deinit(allocator);
-        self.compiled.deinit(allocator);
+        if (!self.compiled_borrowed) self.compiled.deinit(allocator);
     }
 
     /// D-478 — run the module's `(start)` function (Wasm §4.5.4) on the JIT,

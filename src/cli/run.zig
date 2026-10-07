@@ -331,7 +331,7 @@ fn reportDecline(note: decline_note.Note) void {
 /// (`EntryNotCallable`), reported where it is caught. The refusal is
 /// reported after instantiation on both drivers: a validity verdict
 /// (ADR-0229) or a `(start)` trap comes first.
-fn resolveDefaultEntry(alloc: std.mem.Allocator, wasm_view: []const u8) ![]const u8 {
+pub fn resolveDefaultEntry(alloc: std.mem.Allocator, wasm_view: []const u8) ![]const u8 {
     const runner = @import("../engine/runner.zig");
     const entry = (try runner.resolveLenientEntry(alloc, wasm_view)) orelse {
         diagnostic.setDiag(.unknown, .no_func_export, .unknown, "no exported function found (looked for _start, main)", .{});
@@ -586,6 +586,38 @@ pub fn runWasmCapturedFull(
     invoke_args: ?[]const u8,
     limits: Limits,
 ) !u8 {
+    return runCapturedPrecompiled(alloc, io, bytes, .{}, argv, stdout_capture, stderr_capture, stdin, invoke_name, preopens, env_keys, env_vals, invoke_args, limits);
+}
+
+/// What a caller already did to `bytes` before `runCapturedPrecompiled`:
+/// `validated` skips the front-end validation, `jit` is a `CompiledWasm` of
+/// the same bytes the JIT arm instantiates from instead of compiling. The
+/// default (`.{}`) is `runWasmCapturedFull`'s cold path.
+pub const Precompiled = struct {
+    validated: bool = false,
+    jit: ?*const @import("../engine/runner.zig").CompiledWasm = null,
+};
+
+/// `runWasmCapturedFull` with the per-module work already done (`pre`), so a
+/// command run many times pays instantiate + run only. Every per-call input
+/// (argv, stdio, preopens, env, limits) is applied exactly as the cold path
+/// applies it.
+pub fn runCapturedPrecompiled(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    bytes: []const u8,
+    pre: Precompiled,
+    argv: []const []const u8,
+    stdout_capture: ?*std.ArrayList(u8),
+    stderr_capture: ?*std.ArrayList(u8),
+    stdin: StdinSource,
+    invoke_name: ?[]const u8,
+    preopens: []const PreopenDir,
+    env_keys: []const []const u8,
+    env_vals: []const []const u8,
+    invoke_args: ?[]const u8,
+    limits: Limits,
+) !u8 {
     if (dbg.on("jit.callcount")) call_profile.reset();
     defer if (dbg.on("jit.callcount")) call_profile.dump();
 
@@ -658,7 +690,11 @@ pub fn runWasmCapturedFull(
         .size = bytes.len,
         .data = @constCast(bytes.ptr),
     };
-    const module = wasm_c_api.wasm_module_new(store, &bv) orelse {
+    const module_new = if (pre.validated)
+        @import("../api/instance.zig").moduleNewPrecompiled(store, bytes, pre.jit)
+    else
+        wasm_c_api.wasm_module_new(store, &bv);
+    const module = module_new orelse {
         // ADR-0016 M3 — `frontendValidate` sets an attributed validate
         // diagnostic (phase=.validate, op/offset) on the cold path; keep
         // it. Only fall back to the generic message if no detail was set

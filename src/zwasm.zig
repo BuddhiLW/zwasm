@@ -285,6 +285,7 @@ pub const api = struct {
 };
 pub const cli = struct {
     pub const run = @import("cli/run.zig");
+    pub const run_prepared = @import("cli/run_prepared.zig");
     pub const cache = @import("cli/cache.zig");
     pub const invoke_args = @import("cli/invoke_args.zig");
     pub const compile = @import("cli/compile.zig");
@@ -429,6 +430,7 @@ test {
     _ = @import("wasi/adapter.zig");
     _ = @import("wasi/p2_sockets.zig");
     _ = @import("cli/run.zig");
+    _ = @import("cli/run_prepared.zig");
     _ = @import("cli/cache.zig");
     _ = @import("cli/invoke_args.zig");
     _ = @import("feature/component/decode.zig");
@@ -1054,6 +1056,8 @@ test "public API contract — pinned dogfooding consumers" {
     _ = Module.InstantiateOpts;
     _ = cli.run.PreopenDir;
     _ = cli.run.runWasmCapturedFull;
+    _ = cli.run_prepared.PreparedWasi.init;
+    _ = cli.run_prepared.PreparedWasi.run;
     _ = ir.zir.FuncType;
     _ = ir.zir.ValType;
     _ = wasi.host.Host;

@@ -10,6 +10,21 @@ SemVer compatibility guarantees start at the first stable `v2.0.0` tag.
 
 ## [Unreleased]
 
+### Added
+
+- **A WASI command compiled once runs many times: `cli.run_prepared.PreparedWasi`.**
+  `runWasmCapturedFull` validates, JIT-compiles and instantiates on every call,
+  which for a Go wasip1 guest (5-12 MB) is seconds of compile per run.
+  `PreparedWasi.init(alloc, bytes, engine)` validates and compiles once;
+  `run(...)` builds a fresh store, WASI host and instance per call with its own
+  argv, captured stdout/stderr, stdin bytes, preopens, env and limits (fuel,
+  memory, output cap, timeout), and returns the exit code the cold path would,
+  a trap included. Runs only read the compiled code, which outlives every
+  store a run builds. Underneath: `JitInstance.initLinkedShared`
+  instantiates from a borrowed `CompiledWasm`, `moduleNewPrecompiled` builds a
+  C-API module that carries one, and `run.runCapturedPrecompiled` is
+  `runWasmCapturedFull` with that per-module work already done.
+
 ### Fixed
 
 - **A component exporting two or more interfaces exposes all of them.**

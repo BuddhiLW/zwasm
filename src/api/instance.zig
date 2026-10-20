@@ -131,7 +131,33 @@ pub const Module = extern struct {
     /// drops `Send`/`Sync` on it), so this is store-local and needs no atomic
     /// and no mutex. Appended to the opaque handle; C never sees the layout.
     jit_borrowers: u32 = 0,
+    /// A `runner.CompiledWasm` of these bytes, compiled outside any store and
+    /// borrowed (`moduleNewPrecompiled`). When set, the JIT arm of
+    /// instantiation runs setup only, never compile. The lender keeps it alive
+    /// past `wasm_store_delete` of every store this module is used in.
+    shared_jit: ?*const anyopaque = null,
 };
+
+/// `wasm_module_new` for bytes `instantiate.frontendValidate` has already
+/// accepted, optionally carrying a `runner.CompiledWasm` of them
+/// (`Module.shared_jit`). Nothing is validated or compiled here, and the
+/// compile hook does not fire; passing unvalidated bytes is unsafe. The Module
+/// still owns a copy of the bytes, as `wasm_module_new`'s does.
+pub fn moduleNewPrecompiled(store: *Store, bytes: []const u8, shared_jit: ?*const runner.CompiledWasm) ?*Module {
+    const alloc = storeAllocator(store) orelse return null;
+    const owned = alloc.dupe(u8, bytes) catch return null;
+    const m = alloc.create(Module) catch {
+        alloc.free(owned);
+        return null;
+    };
+    m.* = .{
+        .store = store,
+        .bytes_ptr = owned.ptr,
+        .bytes_len = owned.len,
+        .shared_jit = if (shared_jit) |c| @ptrCast(c) else null,
+    };
+    return m;
+}
 
 // Instance + ExportType moved to src/runtime/instance/instance.zig
 // per ADR-0023 §7 item 5. The binding-side wasm_module_t (this
@@ -1390,7 +1416,11 @@ fn instantiateJit(store: *Store, module: *const Module, builder_state: anytype, 
     };
 
     const jit = alloc.create(runner.JitInstance) catch return error.Declined;
-    jit.* = runner.JitInstance.initLinked(alloc, bytes, &.{}, func_imports.cross, &.{}, func_imports.host) catch |err| {
+    const built_jit = if (module.shared_jit) |sj|
+        runner.JitInstance.initLinkedShared(alloc, @ptrCast(@alignCast(sj)), bytes, &.{}, func_imports.cross, &.{}, func_imports.host)
+    else
+        runner.JitInstance.initLinked(alloc, bytes, &.{}, func_imports.cross, &.{}, func_imports.host);
+    jit.* = built_jit catch |err| {
         alloc.destroy(jit);
         // #233 — a validity VERDICT (the module breaks a spec rule the JIT
         // checks and the front-end validator does not yet, #285) is final:
@@ -1513,8 +1543,9 @@ fn instantiateJit(store: *Store, module: *const Module, builder_state: anytype, 
     // (`wasm_instance_exports` + Func handles). The JIT compiles NO
     // `exports_storage`/`func_ptrs_storage` (interp-only), so map its
     // `compiled.exports` (name→funcidx) to `sections.Export{name, .func, idx}`.
-    // The name slices borrow `jit.compiled.arena` (lives in the JitInstance); the
-    // slice itself lives on a minimal per-instance arena freed in the JIT teardown.
+    // The name slices borrow `jit.compiled.arena`: the JitInstance's own, or the
+    // lender's when the module carries `shared_jit` (which outlives the store);
+    // the slice itself lives on a minimal per-instance arena freed in the JIT teardown.
     // ADR-0200 / D-496 — surface ALL exports (func/table/memory/global) through the
     // C-API discovery path so a JIT instance has the SAME embedding surface as interp.
     // Mirrors the interp path (instantiate.zig:1439-1442): decode the export section +

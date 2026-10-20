@@ -30,6 +30,12 @@ SemVer compatibility guarantees start at the first stable `v2.0.0` tag.
 - **A WASI 0.3.2 component binds** — the WASI 0.3.1 and 0.3.2 releases change
   only the package version strings; `test-all` now carries a component bound
   to the 0.3.2 names.
+- **A WASI command compiled once runs many times: `cli.run_prepared.PreparedWasi`.**
+  `runWasmCapturedFull` validates, JIT-compiles and instantiates on every call,
+  which for a Go wasip1 guest (5-12 MB) is seconds of compile per run.
+  `PreparedWasi.init` validates and compiles once; each `run` gets a fresh
+  store, WASI host and instance with its own argv, stdio, preopens, env and
+  limits, and returns the exit code the cold path would, a trap included.
 
 - **`wasm_trap_origin` and `wasm_trap_trace` name where an interpreter trap
   happened** (#498). The origin is the frame that trapped and the trace every

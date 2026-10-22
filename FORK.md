@@ -25,7 +25,7 @@ more than its evidence shows.
 | Patch | Area | Fork PR | Fork `main` | Proven in cljw | Upstream |
 |---|---|---|---|---|---|
 | Interp native-stack limit per calling thread | interp | [#2](https://github.com/BuddhiLW/zwasm/pull/2) | merged `6d38dfcd` | [cljw#74](https://github.com/BuddhiLW/ClojureWasm/pull/74), not yet released | not yet |
-| JIT by-name invoke served from `CompiledWasm.exports` | JIT | [#3](https://github.com/BuddhiLW/zwasm/pull/3) | pending CI | [cljw#76](https://github.com/BuddhiLW/ClojureWasm/pull/76), not yet released | not yet |
+| JIT by-name invoke served from `CompiledWasm.exports` | JIT | [#3](https://github.com/BuddhiLW/zwasm/pull/3) | merged `e9d74934` | [cljw#76](https://github.com/BuddhiLW/ClojureWasm/pull/76), not yet released | not yet |
 
 ### Interp native-stack limit per calling thread
 
@@ -78,7 +78,8 @@ once at compile time.
   | `:jit`, `add.wasm` | 1031 | 882 |
   | `:interp`, either module | 463 to 496 | 600 to 649 (lookup unchanged; noise on a loaded host) |
 
-**Upstream.** Not yet: waits for green fork CI and a cljw release carrying it.
+**Upstream.** Not yet: waits for a cljw release carrying it. Fork CI is green on
+aarch64-linux, aarch64-macos, x86_64-linux and x86_64-windows.
 
 ## Upstreamed
 

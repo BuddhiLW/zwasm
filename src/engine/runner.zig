@@ -1134,7 +1134,7 @@ pub const JitInstance = struct {
     /// a JIT instance before its store (`api/instance.zig` `parkInstance`
     /// / `Module.jit_borrowers`); other callers keep it by hand.
     pub fn exportedFuncTarget(self: *JitInstance, allocator: Allocator, name: []const u8) ?setup_mod.FuncImportTarget {
-        const idx = findExportFunc(allocator, self.wasm_bytes, name) catch return null;
+        const idx = self.exportFuncIdx(allocator, name) catch return null;
         return self.funcTarget(idx);
     }
 
@@ -1315,11 +1315,29 @@ pub const JitInstance = struct {
     /// ADR-0200 — surface a named export's function signature (params/results)
     /// without invoking, so the embedding API can validate arity + type results.
     /// Null when `name` is not an exported function. The JIT path populates no
-    /// `exports_storage`, so this resolves via `findExportFunc` over the bytes.
+    /// `exports_storage`, so this resolves via `exportFuncIdx`.
     pub fn exportFuncSig(self: *JitInstance, allocator: Allocator, name: []const u8) ?FuncType {
-        const idx = findExportFunc(allocator, self.wasm_bytes, name) catch return null;
+        const idx = self.exportFuncIdx(allocator, name) catch return null;
         if (idx >= self.compiled.func_sigs.len) return null;
         return self.compiled.func_sigs[idx];
+    }
+
+    /// Func-space index of the exported function `name`. Served from
+    /// `compiled.exports`, the name -> func idx table built once at compile
+    /// (or restored by the AOT loader), so a by-name invoke costs a scan of
+    /// the module's func exports and nothing proportional to the module.
+    /// Before this, every by-name JIT invoke ran `findExportFunc`, which
+    /// re-parses the whole section list and re-decodes the export section
+    /// (arena + name copies) per call, twice per facade `Instance.invoke`:
+    /// ~5 us per call on a 47 KB module against ~0.5 us on the interpreter.
+    /// A miss falls back to `findExportFunc` so the error kinds are unchanged
+    /// (`ExportIsNotFunction` for a non-func export, `ExportNotFound` else,
+    /// and a func export the table omits still resolves).
+    pub fn exportFuncIdx(self: *JitInstance, allocator: Allocator, name: []const u8) Error!u32 {
+        for (self.compiled.exports) |e| {
+            if (std.mem.eql(u8, e.name, name)) return e.func_idx;
+        }
+        return findExportFunc(allocator, self.wasm_bytes, name);
     }
 
     /// D-496/D-498 — signature by FULL func-space index (for a funcref recovered
@@ -1496,7 +1514,7 @@ pub const JitInstance = struct {
 
     /// Wider arities / v128 result / non-scalar args → `UnsupportedEntrySignature`.
     pub fn invoke(self: *JitInstance, allocator: Allocator, export_name: []const u8, args: []const u64) Error!?u64 {
-        const func_idx = try findExportFunc(allocator, self.wasm_bytes, export_name);
+        const func_idx = try self.exportFuncIdx(allocator, export_name);
         return self.invokeIdx(func_idx, args);
     }
 
@@ -1638,7 +1656,7 @@ pub const JitInstance = struct {
         args: []const u64,
         results_out: []buffer_write.TypedResult,
     ) Error!void {
-        const func_idx = try findExportFunc(allocator, self.wasm_bytes, export_name);
+        const func_idx = try self.exportFuncIdx(allocator, export_name);
         return self.invokeMultiIdx(func_idx, args, results_out);
     }
 

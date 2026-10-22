@@ -2,6 +2,11 @@
 
 A spec-compliant WebAssembly runtime written in Zig.
 
+> **This is BuddhiLW/zwasm, the fork ClojureWasm embeds.** Its `main` is
+> upstream [zwasm/zwasm](https://github.com/zwasm/zwasm) plus the patches listed
+> with their evidence in [`FORK.md`](./FORK.md), each one upstreamed once a
+> ClojureWasm release has proven it.
+
 [![CI](https://github.com/zwasm/zwasm/actions/workflows/ci.yml/badge.svg)](https://github.com/zwasm/zwasm/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/zwasm/zwasm)](https://github.com/zwasm/zwasm/releases)
 [![Zig](https://img.shields.io/badge/Zig-0.16.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org/)

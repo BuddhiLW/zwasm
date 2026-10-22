@@ -358,11 +358,13 @@ pub const Runtime = struct {
     frame_buf: [max_frame_stack]Frame = undefined,
     frame_len: u32 = 0,
 
-    /// D-288 / ADR-0167: cached native-stack low limit for the interp's
-    /// deep-recursion guard. `null` until lazily computed on the first
-    /// `checkNativeStackLimit` (captures the RUNNING thread's stack);
-    /// `0` once computed means the platform query is unsupported →
-    /// the check is skipped and `frame_buf[256]` is the only guard.
+    /// D-288 / ADR-0167: explicit override of the native-stack low limit
+    /// for the interp's deep-recursion guard (tests). `null` (default)
+    /// uses the CALLING thread's own limit, cached per thread in
+    /// `stack_limit.interpStackLimitForCurrentThread` — never on the
+    /// Runtime, because an embedder may call one instance from several
+    /// threads and each has its own stack. `0` disables the check and
+    /// leaves `frame_buf[256]` as the only guard.
     native_stack_limit: ?usize = null,
 
     /// ADR-0179 #3a: cooperative interruption flag, host-owned (lives on the
@@ -611,15 +613,14 @@ pub const Runtime = struct {
     /// recurses natively per wasm call; on the small (~1 MiB) Windows
     /// stack the real ceiling sits BELOW the `frame_buf[256]` guard, so
     /// without this 128–256-deep recursion crashes instead of trapping.
-    /// `sp` is the caller's `@frameAddress()`. The limit is computed
-    /// lazily once on the running thread; a `0` (unsupported-platform)
-    /// limit disables the check, leaving `frame_buf[256]` as the guard.
+    /// `sp` is the caller's `@frameAddress()`. The limit is the CALLING
+    /// thread's, computed lazily once per thread; a `0` (unsupported-
+    /// platform) limit disables the check, leaving `frame_buf[256]` as the
+    /// guard. It is not cached on the Runtime: a limit captured on the first
+    /// caller's stack made every later call from a thread whose stack lies
+    /// below it trap `CallStackExhausted` (cljw CLJW-WASM-INTERP-THREAD-TRAP).
     pub fn checkNativeStackLimit(self: *Runtime, sp: usize) Trap!void {
-        const limit = self.native_stack_limit orelse blk: {
-            const l = stack_limit_mod.computeStackLimit(stack_limit_mod.INTERP_STACK_HEADROOM);
-            self.native_stack_limit = l;
-            break :blk l;
-        };
+        const limit = self.native_stack_limit orelse stack_limit_mod.interpStackLimitForCurrentThread();
         if (limit != 0 and sp <= limit) return Trap.CallStackExhausted;
     }
 
@@ -846,6 +847,32 @@ test "Runtime: native stack-limit check traps CallStackExhausted below the limit
     // even sp==0 passes, leaving frame_buf[256] as the sole guard.
     r.native_stack_limit = 0;
     try r.checkNativeStackLimit(0);
+}
+
+test "Runtime: native stack-limit check is per calling thread, not cached from the first caller" {
+    // A Runtime first invoked on one thread and later on another (an embedder
+    // handing an instance to a worker) must check the SECOND thread's own
+    // stack. Caching the first thread's low limit on the Runtime made every
+    // call from a thread whose stack lies below it trap CallStackExhausted.
+    var r = Runtime.init(testing.allocator);
+    defer r.deinit();
+
+    try r.checkNativeStackLimit(@frameAddress());
+
+    const Worker = struct {
+        fn run(rt: *Runtime, out: *?anyerror) void {
+            rt.checkNativeStackLimit(@frameAddress()) catch |e| {
+                out.* = e;
+            };
+        }
+    };
+    var err: ?anyerror = null;
+    const t = try std.Thread.spawn(.{}, Worker.run, .{ &r, &err });
+    t.join();
+    try testing.expectEqual(@as(?anyerror, null), err);
+
+    // And back on this thread after the worker ran.
+    try r.checkNativeStackLimit(@frameAddress());
 }
 
 test "Runtime: checkInterrupt traps Interrupted only when the host flag is raised (ADR-0179 #3a)" {

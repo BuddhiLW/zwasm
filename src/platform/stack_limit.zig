@@ -96,6 +96,22 @@ comptime {
 /// this binds only on the small (~1 MiB) Windows stack.
 pub const INTERP_STACK_HEADROOM: usize = 128 * 1024;
 
+/// Per-thread cache of `computeStackLimit(INTERP_STACK_HEADROOM)`. The
+/// limit is a property of the thread's stack, so it is cached per thread,
+/// never on a Runtime that several threads may call into. The query is
+/// costly (glibc's `pthread_getattr_np` parses `/proc/self/maps` for the
+/// main thread), hence computed once per thread.
+threadlocal var interp_limit_cache: ?usize = null;
+
+/// The interp deep-recursion limit for the CALLING thread, computed on
+/// its first use on that thread. `disabled` (0) when unsupported.
+pub fn interpStackLimitForCurrentThread() usize {
+    if (interp_limit_cache) |l| return l;
+    const l = computeStackLimit(INTERP_STACK_HEADROOM);
+    interp_limit_cache = l;
+    return l;
+}
+
 /// Sentinel returned when the per-platform query fails OR the
 /// platform isn't supported. The JIT prologue treats `0` as
 /// "always pass" (SP > 0 always), gracefully disabling the probe.

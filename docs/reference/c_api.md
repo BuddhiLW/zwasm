@@ -39,7 +39,9 @@ Full coverage of the wasm-c-api families:
   order, a tag import included — its externtype has kind `WASM_EXTERN_TAG`
   and `wasm_externtype_as_tagtype` gives its parameter signature (#475).
   `wasm_module_exports` lists a tag export the same way (#478); a tag has no
-  `wasm_extern_t`, so `wasm_instance_exports` omits it (#479).
+  `wasm_extern_t`, so `wasm_instance_exports` omits it (#479). A memory64 or
+  table64 bound past `u32` reports as `0xffffffff`, since `wasm_limits_t` is
+  `u32`; the import and export lists stay complete (#670).
 - **Values + vectors**: `wasm_val_*`, `wasm_*_vec_new`/`_copy`/`_delete`.
 - **Traps + frames**: `wasm_trap_*`, `wasm_frame_*`. `wasm_trap_origin` /
   `wasm_trap_trace` name the frames an interpreter trap unwound (function
@@ -51,10 +53,11 @@ Full coverage of the wasm-c-api families:
 Residual *semantic* limits (functions exist + behave honestly, not
 link-stubbed): `wasm_val` `of.ref` = raw payload (D-269); standalone /
 instance / foreign `_copy` → null (D-253-D); `serialize` = source bytes,
-no AOT cache (D-271); a `wasm_table_new` table that has been imported does not
-grow — `wasm_table_grow` returns `false` and the guest's `table.grow` returns
-`-1`, because the two hold separate views of one buffer and a realloc would
-strand the other on the freed one (#449). Reading, writing and `wasm_table_size`
+no AOT cache (D-271); a table that has been imported, whether `wasm_table_new`
+made it or another instance exported it, does not grow on either side —
+`wasm_table_grow` returns `false` and the guest's `table.grow` returns `-1`,
+because the two hold separate views of one buffer and a realloc would strand
+the other on the freed one (#449). Reading, writing and `wasm_table_size`
 are unaffected, and a table that is never imported grows as before.
 
 ## WASI host-setup (`wasi.h`)

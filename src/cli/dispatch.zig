@@ -36,7 +36,7 @@ inline fn eq(a: []const u8, b: []const u8) bool {
 /// produced it (D-598). All of them are passed in as `@tagName` strings to
 /// keep this pure (no build_options coupling) and unit-testable.
 pub fn versionLine(buf: []u8, version: []const u8, wasm_level: []const u8, wasi_level: []const u8, engine: []const u8, mode: []const u8) []const u8 {
-    return std.fmt.bufPrint(
+    return std.mem.print(
         buf,
         "zwasm v{s} (wasm: {s}, wasi: {s}, engine: {s}, mode: {s})\n",
         .{ version, wasm_level, wasi_level, engine, mode },
@@ -53,6 +53,7 @@ pub const usage =
     \\    [--engine <auto|interp|jit>]                    Engine: default auto (prefers JIT, interp fallback); interp|jit force one (both full WASI; jit adds SIMD)
     \\    [--dir <host>[:<guest>]]                   Preopen a host directory for WASI
     \\    [--env <KEY=VAL>]                          Set an environment variable for the guest
+    \\    [--allow-network]                          Let a component's sockets / HTTP reach the host network (default: denied)
     \\    [--fuel <N>]                               Trap after a fuel budget (units are engine-specific:
     \\                                               interp = instructions, jit = function entries + loop iterations)
     \\    [--timeout <ms>]                           Interrupt the guest after a wall-clock deadline
@@ -88,12 +89,12 @@ test "classify: null is banner, unknown token is unknown" {
 
 test "versionLine: carries version + wasm/wasi/engine/mode build identity" {
     var buf: [192]u8 = undefined;
-    const line = versionLine(&buf, "9.9.9", "wasm_3_0", "wasi_0_2", "interp_only", "ReleaseSafe");
+    const line = versionLine(&buf, "9.9.9", "wasm_3_0", "wasi_0_2", "interp_only", "safe");
     try std.testing.expect(std.mem.find(u8, line, "zwasm v9.9.9") != null);
     try std.testing.expect(std.mem.find(u8, line, "wasm: wasm_3_0") != null);
     try std.testing.expect(std.mem.find(u8, line, "wasi: wasi_0_2") != null);
     try std.testing.expect(std.mem.find(u8, line, "engine: interp_only") != null);
-    try std.testing.expect(std.mem.find(u8, line, "mode: ReleaseSafe") != null);
+    try std.testing.expect(std.mem.find(u8, line, "mode: safe") != null);
 }
 
 test "usage text names both shipped subcommands + every run flag main.zig parses" {

@@ -399,6 +399,9 @@ pub fn emitX8664Win64(
     if (n_results == 3 and results_all_gpr) {
         try bytes.appendSlice(allocator, &.{ 0x48, 0x83, 0xEC, 0x28 }); // SUB RSP, 0x28
         if (n_params == 1) {
+            // The GPR load below is the only marshalling here; an FP param
+            // would leave XMM2, where the body reads it, unwritten (#618).
+            if (!all_gpr_class(params.sig.params)) return Error.UnsupportedOp;
             // 1-arg: load a0 into R8 (body's a0 slot) while R8 still = args ptr,
             // then swap RCX↔RDX so body sees RCX=&results, RDX=rt.
             try bytes.appendSlice(allocator, &.{ 0x4D, 0x8B, 0x00 }); // MOV R8, [R8]  (a0)
@@ -556,7 +559,7 @@ fn emitAarch64(allocator: std.mem.Allocator, params: EmitParams) Error!EmitOutpu
     try writeInsn(allocator, &bytes, 0xA9BF7BE1);
     // Precompute each param's load word + whether its dest is X2 (the args base).
     var load_words: [7]u32 = undefined;
-    var load_is_base: [7]bool = [_]bool{false} ** 7;
+    var load_is_base: [7]bool = @splat(false);
     {
         var gpr_n: u32 = 0;
         var fp_n: u32 = 0;
@@ -1024,6 +1027,15 @@ test "wrapper_thunk: emitX8664Win64 1-arg 3-int MEMORY-class (i32) -> (i32, i32,
     try testing.expectEqualSlices(u8, &.{ 0x48, 0x83, 0xC4, 0x28 }, out.bytes[15..19]);
     // XOR EAX, EAX ; RET
     try testing.expectEqualSlices(u8, &.{ 0x31, 0xC0, 0xC3 }, out.bytes[19..22]);
+}
+
+test "wrapper_thunk: emitX8664Win64 1-arg 3-int MEMORY-class with an FP param → UnsupportedOp (#618)" {
+    const VT = @import("../../../ir/zir.zig").ValType;
+    const results = [_]VT{ .i32, .i32, .i32 };
+    for ([_]VT{ .f32, .f64 }) |p0| {
+        const p = [_]VT{p0};
+        try testing.expectError(Error.UnsupportedOp, emitX8664Win64(testing.allocator, .{ .sig = .{ .params = &p, .results = &results }, .body_offset = 400, .thunk_offset = 0 }));
+    }
 }
 
 test "wrapper_thunk: EmitParams + EmitOutput types present" {

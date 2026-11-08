@@ -1,4 +1,4 @@
-// FILE-SIZE-EXEMPT: the P3 async driver + its official-corpus test suite (ADR-0193; compiles only under the p3-forced module); driver and corpus harness share the run loop — a split duplicates fixtures (N4) (investigated 2026-08-12, per ADR-0099)
+// FILE-SIZE-EXEMPT: the P3 async driver + its official-corpus test suite (ADR-0193; compiles only at -Dwasi>=p3); driver and corpus harness share the run loop — a split duplicates fixtures (N4) (investigated 2026-08-12, per ADR-0099)
 //! WASI **Preview 3** / Component-Model async runner (D-335 unit D-ηB,
 //! ADR-0188). Drives an async-lifted component export through the stackless
 //! callback ABI: instantiate (reusing the P2 general engine — async is a
@@ -13,8 +13,10 @@
 const std = @import("std");
 
 const async_mod = @import("../feature/component/async.zig");
+const ctypes = @import("../feature/component/types.zig");
 const net = std.Io.net;
 const p3http = @import("../wasi/p3_http.zig");
+const p2_sockets = @import("../wasi/p2_sockets.zig");
 const wasi_host = @import("../wasi/host.zig");
 const wasi_p2 = @import("component_wasi_p2.zig");
 
@@ -131,20 +133,23 @@ pub fn runWasiP3Main(engine: *Engine, alloc: Allocator, bytes: []const u8, host:
 /// can inspect the result the guest delivered via `task.return`
 /// (`built.ctx.task_return`, ADR-0189 ζ2) after the loop exits.
 pub fn driveAsyncMain(built: *wasi_p2.BuiltComponent) anyerror!void {
-    return driveAsyncCall(built, &.{});
+    return driveAsyncCall(built, firstAsyncLift(built) orelse return error.NoAsyncExport, &.{});
 }
 
-/// Drive the first async-lifted export with explicit core args (the service
-/// world's `handler.handle` takes the request handle; ADR-0205 D-3).
-pub fn driveAsyncCall(built: *wasi_p2.BuiltComponent, args: []const Value) anyerror!void {
-    // async is an export property (ADR-0188): the first `canon lift` with
-    // `opts.is_async` is the task to drive; its `callback` is the loop re-entry.
-    const lift = blk: {
-        for (built.info.canons.items) |c| {
-            if (c == .lift and c.lift.opts.is_async) break :blk c.lift;
-        }
-        return error.NoAsyncExport;
-    };
+/// The first `canon lift` with `opts.is_async`: the task `driveAsyncMain` and
+/// the service world's `handler.handle` drive. `zwasm run` selects its entry
+/// by name instead (`runWasiMain`).
+fn firstAsyncLift(built: *const wasi_p2.BuiltComponent) ?ctypes.Lift {
+    for (built.info.canons.items) |c| {
+        if (c == .lift and c.lift.opts.is_async) return c.lift;
+    }
+    return null;
+}
+
+/// Drive the async-lifted `lift` with explicit core args (the service world's
+/// `handler.handle` takes the request handle; ADR-0205 D-3). Async is an export
+/// property (ADR-0188); the lift's `callback` is the loop re-entry.
+pub fn driveAsyncCall(built: *wasi_p2.BuiltComponent, lift: ctypes.Lift, args: []const Value) anyerror!void {
     const callback_idx = lift.opts.callback orelse return error.NoAsyncCallback;
 
     const entry_ref = built.info.resolveCoreFuncExport(lift.core_func) orelse return error.NoRunExport;
@@ -180,6 +185,7 @@ pub fn driveAsyncCall(built: *wasi_p2.BuiltComponent, args: []const Value) anyer
         return error.Unreachable;
     // `run: async func() -> result` — an `err` task.return (discriminant 1) is
     // exit code 1 per the wasi:cli command contract (official run-with-err.wasm).
+    // Any other result reads the same way; `zwasm run` only drives that shape.
     if (built.ctx.task_return) |tr| {
         if (tr != 0 and built.ctx.host.exit_code == null) built.ctx.host.exit_code = 1;
     }
@@ -558,6 +564,27 @@ test "D-335 typed marshalling: a stream<u32>.write of 2 elements transfers 8 byt
     defer built.deinit();
     try driveAsyncMain(&built);
     try testing.expectEqualSlices(u8, &.{ 0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55 }, capture.items);
+}
+
+test "a stream write whose byte span does not fit in u32 traps as the access to that span" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, "test/component/stream_write_count_max.wasm", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+
+    var eng = try Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var host = try wasi_host.Host.init(testing.allocator);
+    defer host.deinit();
+    var capture: std.ArrayList(u8) = .empty;
+    defer capture.deinit(testing.allocator);
+    host.stdout_buffer = &capture;
+
+    var built = try wasi_p2.buildWasiP2Component(&eng, testing.allocator, bytes, &host, .{});
+    defer built.deinit();
+    try testing.expectError(error.OutOfBoundsLoad, driveAsyncMain(&built));
+    try testing.expectEqual(@as(usize, 0), capture.items.len);
 }
 
 test "D-335 unit E1: wasi:cli/stderr write-via-stream routes a guest stream.write to fd 2" {
@@ -1015,7 +1042,7 @@ const ExternalClient = struct {
             .send => {
                 const s = self.stream orelse return false;
                 const data = [_][]const u8{self.ops[self.next].payload};
-                _ = self.io.vtable.netWrite(self.io.userdata, s.socket.handle, "", &data, 1) catch return false;
+                _ = p2_sockets.netWrite(self.io, s.socket.handle, &data) catch return false;
                 self.next += 1;
                 return true;
             },
@@ -1037,75 +1064,7 @@ const ExternalClient = struct {
     }
 };
 
-/// The manifest `endpoints` echo server (http-client, ADR-0205 D-5): one
-/// HTTP/1.1 connection served on a background thread — read head +
-/// content-length body, echo it back. The listener is created on the main
-/// io (Threaded is thread-safe); `stop` dials a wake-up connection if the
-/// guest never connected.
-const EchoEndpoint = struct {
-    io: std.Io,
-    server: net.Server,
-    port: u16,
-    thread: std.Thread,
-
-    fn start(io: std.Io) !*EchoEndpoint {
-        const self = try std.heap.page_allocator.create(EchoEndpoint);
-        errdefer std.heap.page_allocator.destroy(self);
-        const addr: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(0) };
-        self.io = io;
-        self.server = try addr.listen(io, .{ .mode = .stream, .protocol = .tcp });
-        self.port = self.server.socket.address.getPort();
-        self.thread = try std.Thread.spawn(.{}, serve, .{self});
-        return self;
-    }
-
-    fn serve(self: *EchoEndpoint) void {
-        const io = self.io;
-        var conn = self.server.accept(io) catch return;
-        defer conn.close(io);
-        var buf: [65536]u8 = undefined;
-        var n: usize = 0;
-        // Read until the header terminator, then the content-length body.
-        var head_end: usize = 0;
-        while (head_end == 0) {
-            var bufs = [_][]u8{buf[n..]};
-            const got = io.vtable.netRead(io.userdata, conn.socket.handle, &bufs) catch return;
-            if (got == 0) return;
-            n += got;
-            if (std.mem.find(u8, buf[0..n], "\r\n\r\n")) |p| head_end = p + 4;
-        }
-        var content_len: usize = 0;
-        var lines = std.mem.splitSequence(u8, buf[0..head_end], "\r\n");
-        while (lines.next()) |line| {
-            const prefix = "content-length:";
-            if (line.len > prefix.len and std.ascii.eqlIgnoreCase(line[0..prefix.len], prefix)) {
-                content_len = std.fmt.parseInt(usize, std.mem.trim(u8, line[prefix.len..], " "), 10) catch 0;
-            }
-        }
-        while (n - head_end < content_len) {
-            var bufs = [_][]u8{buf[n..]};
-            const got = io.vtable.netRead(io.userdata, conn.socket.handle, &bufs) catch return;
-            if (got == 0) break;
-            n += got;
-        }
-        const body = buf[head_end..n];
-        var out: [66000]u8 = undefined;
-        const resp = std.fmt.bufPrint(&out, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch return;
-        const data = [_][]const u8{resp};
-        _ = io.vtable.netWrite(io.userdata, conn.socket.handle, "", &data, 1) catch return;
-    }
-
-    fn stop(self: *EchoEndpoint) void {
-        // Unblock a never-connected accept, then reap the thread.
-        const addr: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(self.port) };
-        if (addr.connect(self.io, .{ .mode = .stream, .protocol = .tcp })) |s| s.close(self.io) else |_| {
-            // Already connected/served — the accept has returned; nothing to wake.
-        }
-        self.thread.join();
-        self.server.deinit(self.io);
-        std.heap.page_allocator.destroy(self);
-    }
-};
+const EchoEndpoint = @import("component_http_echo.zig").EchoEndpoint;
 
 /// The no-progress hook for service driving (ADR-0205 D-3): once the guest
 /// delivered its response via task.return, register the harness capture
@@ -1198,7 +1157,7 @@ fn runServiceRequest(built: *wasi_p2.BuiltComponent, rop: HttpReqOp) !void {
         ctx.external_sock_ctx = null;
         if (svc.registered_shared) |sid| _ = ctx.host_capture_sinks.remove(sid);
     }
-    try driveAsyncCall(built, &.{.{ .i32 = @bitCast(req_handle) }});
+    try driveAsyncCall(built, firstAsyncLift(built) orelse return error.NoAsyncExport, &.{.{ .i32 = @bitCast(req_handle) }});
 
     // Assert the delivered response.
     try testing.expectEqual(@as(?u32, 0), ctx.task_return);
@@ -1238,7 +1197,7 @@ fn runServiceRequest(built: *wasi_p2.BuiltComponent, rop: HttpReqOp) !void {
 ///
 /// `@src().fn_name` inside a test block is `test.<the block's name>`; several
 /// blocks append a parenthesised note, which is not part of the file stem.
-fn officialCorpusName(comptime src: std.builtin.SourceLocation) []const u8 {
+fn officialCorpusName(comptime src: std.lang.SourceLocation) []const u8 {
     const marker = "test.wasip3-official: ";
     const at = std.mem.find(u8, src.fn_name, marker) orelse
         @compileError("official corpus test must be named `wasip3-official: <corpus stem>`");
@@ -1273,6 +1232,7 @@ fn runOfficialWasip3Test(comptime name: []const u8) !void {
     var host = try wasi_host.Host.init(alloc);
     defer host.deinit();
     host.io = io;
+    host.allow_network = true;
 
     // "root" preopen: copy the vendored tree into a fresh tmp dir (the guest
     // mutates it) and map it as guest "/" (the upstream wasmtime adapter's
@@ -1280,7 +1240,7 @@ fn runOfficialWasip3Test(comptime name: []const u8) !void {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     if (expect.root) |root_name| {
-        const src_path = try std.fmt.allocPrint(alloc, "test/component/wasip3_official/{s}", .{root_name});
+        const src_path = try alloc.print("test/component/wasip3_official/{s}", .{root_name});
         defer alloc.free(src_path);
         var src_dir = try std.Io.Dir.cwd().openDir(io, src_path, .{ .iterate = true });
         defer src_dir.close(io);
@@ -1318,7 +1278,7 @@ fn runOfficialWasip3Test(comptime name: []const u8) !void {
         var endpoint_buf: [32]u8 = undefined;
         if (expect.has_endpoints) {
             endpoint = try EchoEndpoint.start(io);
-            const ep_addr = try std.fmt.bufPrint(&endpoint_buf, "127.0.0.1:{d}", .{endpoint.?.port});
+            const ep_addr = try std.mem.print(&endpoint_buf, "127.0.0.1:{d}", .{endpoint.?.port});
             try host.setEnvs(&.{"HTTP_ENDPOINT"}, &.{ep_addr});
         }
         var built = try wasi_p2.buildWasiP2Component(&eng, alloc, bytes, &host, .{});
@@ -1355,7 +1315,7 @@ fn runOfficialWasip3Test(comptime name: []const u8) !void {
             var got: usize = 0;
             while (got < buf.len) {
                 var bufs = [_][]u8{buf[got..]};
-                const n = try io.vtable.netRead(io.userdata, s.socket.handle, &bufs);
+                const n = try p2_sockets.netRead(io, s.socket.handle, &bufs);
                 if (n == 0) break;
                 got += n;
             }
@@ -1595,7 +1555,7 @@ test "wasip3_official corpus: every vendored binary has a block that runs it" {
 
     var absent: u32 = 0;
     for (covered.items) |c| {
-        const rel = try std.fmt.allocPrint(alloc, "{s}.wasm", .{c});
+        const rel = try alloc.print("{s}.wasm", .{c});
         defer alloc.free(rel);
         root.access(io, rel, .{}) catch {
             absent += 1;

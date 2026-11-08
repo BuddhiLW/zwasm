@@ -21,8 +21,6 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const sections = @import("../../parse/sections.zig");
-const zir = @import("../../ir/zir.zig");
-const ValType = zir.ValType;
 
 pub const Error = error{
     /// v128 field declared in a struct/array typedef. Deferred per
@@ -199,7 +197,7 @@ pub fn materialiseGcTypes(alloc: Allocator, types: sections.Types) Error!GcTypeI
     for (entries, 0..) |*entry, i| {
         const kind = types.kinds[i];
         entry.* = .{
-            .supertype_chain = [_]u32{0} ** 8,
+            .supertype_chain = @splat(0),
             .depth = 0,
             .kind = switch (kind) {
                 .func => .func,

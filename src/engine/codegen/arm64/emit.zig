@@ -57,7 +57,6 @@ const regalloc = @import("../shared/regalloc.zig");
 const setup = @import("emit_setup.zig");
 const computeOutgoingMaxBytes = setup.computeOutgoingMaxBytes;
 const computeLocalLayout = setup.computeLocalLayout;
-const LocalLayout = setup.LocalLayout;
 const jit_abi = @import("../shared/jit_abi.zig");
 const exception_table = @import("../shared/exception_table.zig");
 const trap_registry = @import("../../../platform/trap_registry.zig"); // ADR-0202 D3
@@ -69,8 +68,8 @@ const build_options = @import("build_options");
 /// comptime const keeps the 3.0 `*.emit` symbols out of `-Dwasm=v1_0|v2_0`
 /// binaries (ADR-0073 "absent from binary"; ADR-0130 / D-230 leak fix). The arms
 /// are unreachable in sub-3.0 builds anyway (feature_level_check forbids lowering).
-const wasm_v3_plus = @intFromEnum(build_options.wasm_level) >=
-    @intFromEnum(@TypeOf(build_options.wasm_level).v3_0);
+const wasm_v3_plus = @backingInt(build_options.wasm_level) >=
+    @backingInt(@TypeOf(build_options.wasm_level).v3_0);
 
 const op_throw = @import("ops/wasm_3_0/throw.zig");
 const op_throw_ref = @import("ops/wasm_3_0/throw_ref.zig");
@@ -95,15 +94,9 @@ const op_simd_int_cmp_lane = @import("op_simd_int_cmp_lane.zig");
 const op_simd_float = @import("op_simd_float.zig");
 
 const Label = label_mod.Label;
-const LabelKind = label_mod.LabelKind;
-const Fixup = label_mod.Fixup;
-const FixupKind = label_mod.FixupKind;
 
 const Allocator = std.mem.Allocator;
 const ZirFunc = zir.ZirFunc;
-const ZirInstr = zir.ZirInstr;
-const ZirOp = zir.ZirOp;
-const Xn = inst.Xn;
 const EmitCtx = ctx_mod.EmitCtx;
 
 /// Re-export from `ctx.zig`. The error set lives there so
@@ -1622,17 +1615,14 @@ pub fn compile(
             // the dropped-flag byte at `[r15+ptr_off]+idx`. No
             // operands consumed; no result pushed. validator already
             // bounds-checks the index, so no trap path needed.
-            .@"data.drop" => {
-                if (ins.payload >= 4096) return Error.UnsupportedOp;
-                try gpr.writeU32(allocator, &buf, inst.encLdrImm(16, abi.runtime_ptr_save_gpr, jit_abi.data_dropped_ptr_off));
+            // `baseOffLarge` reaches byte offsets (= idx) below 2^24.
+            .@"data.drop", .@"elem.drop" => {
+                if (ins.payload >= (1 << 24)) return Error.UnsupportedOp;
+                const ptr_off = if (ins.op == .@"data.drop") jit_abi.data_dropped_ptr_off else jit_abi.elem_dropped_ptr_off;
+                try gpr.writeU32(allocator, &buf, inst.encLdrImm(16, abi.runtime_ptr_save_gpr, ptr_off));
+                const flag = try gpr.baseOffLarge(allocator, &buf, 16, 16, @intCast(ins.payload), 4095);
                 try gpr.writeU32(allocator, &buf, inst.encMovzImm16(17, 1));
-                try gpr.writeU32(allocator, &buf, inst.encStrbImm(17, 16, @intCast(ins.payload)));
-            },
-            .@"elem.drop" => {
-                if (ins.payload >= 4096) return Error.UnsupportedOp;
-                try gpr.writeU32(allocator, &buf, inst.encLdrImm(16, abi.runtime_ptr_save_gpr, jit_abi.elem_dropped_ptr_off));
-                try gpr.writeU32(allocator, &buf, inst.encMovzImm16(17, 1));
-                try gpr.writeU32(allocator, &buf, inst.encStrbImm(17, 16, @intCast(ins.payload)));
+                try gpr.writeU32(allocator, &buf, inst.encStrbImm(17, flag.base, @intCast(flag.off)));
             },
             // Table ops (per ADR-0058):
             // table.get / table.set / table.size — bounds-checked
@@ -1921,7 +1911,7 @@ pub fn compile(
                         const new_word: u32 = if ((orig >> 26) == 0b000101)
                             inst.encB(disp_words)
                         else blk: {
-                            const cond: inst.Cond = @enumFromInt(@as(u4, @intCast(orig & 0xF)));
+                            const cond: inst.Cond = @fromBackingInt(@intCast(@as(u4, @intCast(orig & 0xF))));
                             break :blk inst.encBCond(cond, disp_words);
                         };
                         std.mem.writeInt(u32, buf.items[fx_byte..][0..4], new_word, .little);
@@ -1985,7 +1975,7 @@ pub fn compile(
                             const new_word: u32 = if ((orig >> 26) == 0b000101)
                                 inst.encB(disp_words)
                             else blk: {
-                                const cond: inst.Cond = @enumFromInt(@as(u4, @intCast(orig & 0xF)));
+                                const cond: inst.Cond = @fromBackingInt(@intCast(@as(u4, @intCast(orig & 0xF))));
                                 break :blk inst.encBCond(cond, disp_words);
                             };
                             std.mem.writeInt(u32, b.items[fx_byte..][0..4], new_word, .little);

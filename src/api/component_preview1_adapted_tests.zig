@@ -11,6 +11,7 @@ const component = @import("component.zig");
 const adapter = @import("../wasi/adapter.zig");
 const wasi_host = @import("../wasi/host.zig");
 const Engine = @import("../zwasm/engine.zig").Engine;
+const runWasiP2Main = @import("component_wasi_p2.zig").runWasiP2Main;
 
 const open = component.open;
 const componentNeedsWasi = component.componentNeedsWasi;
@@ -75,10 +76,40 @@ test "preview1-adapted command component links and its exported func invokes" {
     try testing.expectEqualStrings("cmd", out);
 }
 
-test "p2 filesystem-error-code answers none; wall-clock resolution is a datetime" {
-    // Direct trampoline check through the classifier, the same way the
-    // adapter reaches it: an import row the table did not classify could
-    // never be linked.
+test "p2 classifier: filesystem-error-code and the 0.2 wall-clock resolution have rows" {
+    // An import row the table did not classify could never be linked.
     try testing.expectEqual(adapter.P2Op.fs_filesystem_error_code, adapter.classifyImport("wasi:filesystem/types", "filesystem-error-code", .p2).?);
     try testing.expectEqual(adapter.P2Op.clocks_wall_resolution, adapter.classifyImport("wasi:clocks/wall-clock", "resolution", .p2).?);
+}
+
+/// Run a `wasi:cli/run` fixture and return its exit code. The adapted
+/// fixtures link these rows but never call them (the adapter reaches
+/// `resolution` only on `clock_res_get`, `filesystem-error-code` only on
+/// `last-operation-failed`), so these fixtures call them directly.
+fn runFixture(path: []const u8) !?u32 {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+
+    var eng = try Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var host = try wasi_host.Host.init(testing.allocator);
+    defer host.deinit();
+    host.io = io;
+    try runWasiP2Main(&eng, testing.allocator, bytes, &host, .{});
+    return host.exit_code;
+}
+
+test "p2 wall-clock resolution() writes seconds at +0 and nanoseconds < 1e9 at +8" {
+    // run() fills the return area with 0xAA, calls resolution(retptr) and
+    // exits 0 iff seconds@+0 < 2^32 and nanoseconds@+8 < 1e9.
+    try testing.expectEqual(@as(?u32, 0), try runFixture("test/component/wasi_p2_wall_resolution.wasm"));
+}
+
+test "p2 filesystem-error-code writes option disc 0 (none) at retptr" {
+    // run() fills the return area with 0xFF, calls
+    // filesystem-error-code(err, retptr) and exits 0 iff the byte at retptr is 0.
+    try testing.expectEqual(@as(?u32, 0), try runFixture("test/component/wasi_p2_fs_error_code.wasm"));
 }

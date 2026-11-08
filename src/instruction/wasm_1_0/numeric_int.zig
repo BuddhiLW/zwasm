@@ -25,11 +25,10 @@ const ZirInstr = zir.ZirInstr;
 const DispatchTable = dispatch.DispatchTable;
 const InterpCtx = dispatch.InterpCtx;
 const Runtime = runtime.Runtime;
-const Value = runtime.Value;
 const Trap = runtime.Trap;
 
 inline fn op(t: ZirOp) usize {
-    return @intFromEnum(t);
+    return @backingInt(t);
 }
 
 pub fn register(table: *DispatchTable) void {

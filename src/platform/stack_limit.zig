@@ -91,9 +91,8 @@ comptime {
 /// (no guard page, no SEH), so it needs only enough margin to cover
 /// the native growth BETWEEN two consecutive `invoke` checks (a few
 /// frames: invoke + dispatch loop + the call handler). 128 KiB is
-/// platform-independent and comfortably exceeds that; on large stacks
-/// (Mac/Linux 8 MiB) the `frame_buf[256]` guard fires first anyway, so
-/// this binds only on the small (~1 MiB) Windows stack.
+/// platform-independent and comfortably exceeds that. On every default
+/// stack this check binds before `Runtime.max_frame_depth` does.
 pub const INTERP_STACK_HEADROOM: usize = 128 * 1024;
 
 /// Per-thread cache of `computeStackLimit(INTERP_STACK_HEADROOM)`. The
@@ -243,7 +242,7 @@ fn computeLinux(headroom: usize) usize {
         if (rlimit >= b.high) return disabled;
         return b.high - rlimit + headroom;
     }
-    var attr: PthreadAttr = .{ ._opaque = [_]u8{0} ** 64 };
+    var attr: PthreadAttr = .{ ._opaque = @splat(0) };
     if (pthread_getattr_np(std.c.pthread_self(), &attr) != 0) return disabled;
     defer _ = pthread_attr_destroy(&attr);
     var low_opt: ?*anyopaque = null;
@@ -292,7 +291,7 @@ pub fn nativeStackHigh() usize {
             const b = procStackBounds() orelse return 0;
             return b.high;
         }
-        var attr: PthreadAttr = .{ ._opaque = [_]u8{0} ** 64 };
+        var attr: PthreadAttr = .{ ._opaque = @splat(0) };
         if (pthread_getattr_np(std.c.pthread_self(), &attr) != 0) return 0;
         defer _ = pthread_attr_destroy(&attr);
         var low_opt: ?*anyopaque = null;

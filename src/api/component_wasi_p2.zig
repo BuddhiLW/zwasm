@@ -40,6 +40,7 @@ const build_options = @import("build_options");
 const ctx_mod = @import("component_wasi_ctx.zig");
 const lower_realloc = @import("component_lower_realloc.zig");
 const p3h = @import("component_wasi_p3_host.zig");
+const p2http = @import("component_wasi_p2_http.zig");
 
 // Substrate re-exports (compat surface, ADR-0207 I1) + local aliases so the
 // moved trampoline bodies read unchanged.
@@ -60,6 +61,7 @@ const Memory = ctx_mod.Memory;
 const FilestatResult = ctx_mod.FilestatResult;
 const ctxMemory = ctx_mod.ctxMemory;
 const ctxIo = ctx_mod.ctxIo;
+const ctxRequireNetwork = ctx_mod.ctxRequireNetwork;
 const ctxTcpSocket = ctx_mod.ctxTcpSocket;
 const ctxUdpSocket = ctx_mod.ctxUdpSocket;
 const descriptorFilestat = ctx_mod.descriptorFilestat;
@@ -138,10 +140,12 @@ fn p2ExitWithCode(caller: *Caller, code: u32) WasiP2Error!void {
 /// memory / return area. `now()` is infallible in WIT and the component-run
 /// path always has `host.io`, so a clock-read failure is a host-setup bug.
 fn p2MonotonicNow(caller: *Caller) WasiP2Error!i64 {
-    const ctx = caller.data(WasiP2Ctx);
-    const ns = wasi_clocks.clockTimeNs(ctx.host, 1) catch
+    return @bitCast(try monotonicNs(caller.data(WasiP2Ctx)));
+}
+
+fn monotonicNs(ctx: *WasiP2Ctx) WasiP2Error!u64 {
+    return wasi_clocks.clockTimeNs(ctx.host, 1) catch
         return WasiP2Error.NoHostIo; // precondition: the component-run path plants host.io
-    return @bitCast(ns);
 }
 
 /// `wasi:clocks/wall-clock` `now()` → datetime{seconds: u64, nanoseconds: u32}.
@@ -252,6 +256,7 @@ fn inStreamReadImpl(caller: *Caller, self_handle: u32, len: u64, retptr: u32, bl
     const h = try ctx.resources.peek(self_handle);
     if (h.rt == WasiP2Ctx.SOCK_INPUT_STREAM_RT) return sockStreamRead(ctx, mem, h.rep, len, retptr, blocking);
     if (h.rt == WasiP2Ctx.FILE_INPUT_STREAM_RT) return fileStreamRead(ctx, mem, h.rep, len, retptr);
+    if (h.rt == WasiP2Ctx.HTTP_BODY_IN_RT) return p2http.bodyInRead(ctx, mem, h.rep, len, retptr);
     if (h.rt != WasiP2Ctx.INPUT_STREAM_RT) return resource_table.Error.TypeMismatch;
     const n: u32 = @intCast(@min(len, std.math.maxInt(u32)));
     // `read` may not wait: nothing queued on an inherited stdin is ok([]).
@@ -329,7 +334,7 @@ fn fileStreamRead(ctx: *WasiP2Ctx, mem: Memory, rep: u32, len: u64, retptr: u32)
 }
 
 fn ctxFileStream(ctx: *WasiP2Ctx, rep: u32) WasiP2Error!*WasiP2Ctx.FileStream {
-    if (rep >= ctx.file_streams.items.len) return WasiP2Error.InvalidHandle;
+    if (rep >= ctx.file_streams.items.len or ctx.file_streams.items[rep].dropped) return WasiP2Error.InvalidHandle;
     return &ctx.file_streams.items[rep];
 }
 
@@ -377,7 +382,11 @@ pub fn p2OutStreamWrite(caller: *Caller, self_handle: u32, ptr: u32, len: u32, r
     if (h.rt == WasiP2Ctx.FILE_OUTPUT_STREAM_RT) {
         // pwrite at the stream's position; a failure is closed, as above.
         const stream = try ctxFileStream(ctx, h.rep);
-        if (wasi_fd.pwriteSlice(ctx.host, stream.fd, bytes, stream.pos) != .success) {
+        const errno = if (stream.append)
+            wasi_fd.appendSlice(ctx.host, stream.fd, bytes)
+        else
+            wasi_fd.pwriteSlice(ctx.host, stream.fd, bytes, stream.pos);
+        if (errno != .success) {
             try mem.write(retptr, @as(u8, 1));
             try mem.write(retptr + 4, @as(u8, 1)); // stream-error::closed
             return;
@@ -386,6 +395,7 @@ pub fn p2OutStreamWrite(caller: *Caller, self_handle: u32, ptr: u32, len: u32, r
         try mem.write(retptr, @as(u8, 0));
         return;
     }
+    if (h.rt == WasiP2Ctx.HTTP_BODY_OUT_RT) return p2http.bodyOutWrite(ctx, mem, h.rep, bytes, retptr);
     if (h.rt != WasiP2Ctx.OUTPUT_STREAM_RT) return resource_table.Error.TypeMismatch;
     const fd: wasi_p1.Fd = @intCast(h.rep);
     if (wasi_fd.writeSlice(ctx.host, fd, bytes) != .success) return WasiP2Error.WriteFailed;
@@ -435,13 +445,21 @@ fn p2ResourceDrop(caller: *Caller, self_handle: u32) WasiP2Error!void {
     // fd-backed resources (stdio/descriptor streams) close their fd; a pollable
     // carries no host fd and a directory-entry-stream or file stream borrows
     // its descriptor's fd (rep = a `dir_streams` / `file_streams` index), so
-    // those only release the handle slot.
+    // those close no fd.
     if (try ctx.resources.dropAny(self_handle)) |h| {
         switch (h.rt) {
-            // Pollables / dir-entry-streams / file streams / networks /
+            // Pollables / dir-entry-streams / networks /
             // socket streams / terminals carry no exclusively-owned host fd —
             // only the handle slot is released.
-            WasiP2Ctx.POLLABLE_RT, WasiP2Ctx.DIR_STREAM_RT, WasiP2Ctx.FILE_INPUT_STREAM_RT, WasiP2Ctx.FILE_OUTPUT_STREAM_RT, WasiP2Ctx.NETWORK_RT, WasiP2Ctx.SOCK_POLLABLE_RT, WasiP2Ctx.SOCK_INPUT_STREAM_RT, WasiP2Ctx.SOCK_OUTPUT_STREAM_RT, WasiP2Ctx.TERMINAL_RT, WasiP2Ctx.STDIN_POLLABLE_RT => {},
+            WasiP2Ctx.POLLABLE_RT, WasiP2Ctx.DIR_STREAM_RT, WasiP2Ctx.NETWORK_RT, WasiP2Ctx.SOCK_POLLABLE_RT, WasiP2Ctx.SOCK_INPUT_STREAM_RT, WasiP2Ctx.SOCK_OUTPUT_STREAM_RT, WasiP2Ctx.TERMINAL_RT, WasiP2Ctx.STDIN_POLLABLE_RT => {},
+            // A file stream's entry is free for the next mint.
+            WasiP2Ctx.FILE_INPUT_STREAM_RT, WasiP2Ctx.FILE_OUTPUT_STREAM_RT => {
+                if (h.rep < ctx.file_streams.items.len) ctx.file_streams.items[h.rep].dropped = true;
+            },
+            // A clock pollable's entry is free for the next mint.
+            WasiP2Ctx.CLOCK_POLLABLE_RT => {
+                if (h.rep < ctx.clock_deadlines.items.len) ctx.clock_deadlines.items[h.rep].dropped = true;
+            },
             // The tcp-socket handle owns the OS socket.
             WasiP2Ctx.TCP_SOCKET_RT => {
                 const sock = ctxTcpSocket(ctx, h.rep) catch return; // slot already gone
@@ -470,6 +488,7 @@ fn p2ResourceDrop(caller: *Caller, self_handle: u32) WasiP2Error!void {
                         ctx.http_fields.items[resp.headers_rep].deinit(ctx.alloc);
                     ctx.p3().drop_transferred_end(ctx, resp.trailers_future);
                     if (resp.contents_stream) |s| ctx.p3().drop_transferred_end(ctx, s);
+                    p2http.releaseResponse(ctx, h.rep);
                 }
             },
             // The request owns its uri strings, its headers fields storage,
@@ -483,9 +502,11 @@ fn p2ResourceDrop(caller: *Caller, self_handle: u32) WasiP2Error!void {
                         ctx.http_fields.items[req.headers_rep].deinit(ctx.alloc);
                     ctx.p3().drop_transferred_end(ctx, req.trailers_future);
                     if (req.contents_stream) |s| ctx.p3().drop_transferred_end(ctx, s);
+                    p2http.releaseRequest(ctx, h.rep);
                     req.deinit(ctx.alloc);
                 }
             },
+            WasiP2Ctx.HTTP2_OUTGOING_BODY_RT, WasiP2Ctx.HTTP2_FUTURE_RESPONSE_RT, WasiP2Ctx.HTTP2_INCOMING_BODY_RT, WasiP2Ctx.HTTP2_FUTURE_TRAILERS_RT, WasiP2Ctx.HTTP_BODY_OUT_RT, WasiP2Ctx.HTTP_BODY_IN_RT => try p2http.dropResource(ctx, h.rt, h.rep),
             else => _ = wasi_fd.fdClose(ctx.host, @intCast(h.rep)),
         }
     }
@@ -541,6 +562,221 @@ test "D-444 II: p2ResourceDrop(HTTP_REQUEST_RT) — releases transferred ends + 
     try p2ResourceDrop(&caller, h2);
 }
 
+test "0.2 append-via-stream: two append streams on one file each write at the end the other left" {
+    const Runtime = @import("../runtime/runtime.zig").Runtime;
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "log.txt", .data = "abc" });
+    var host = try wasi_host.Host.init(testing.allocator);
+    defer host.deinit();
+    host.io = io;
+    const dirfd = try host.addPreopen(tmp.dir.handle, "/w");
+    var ctx = try WasiP2Ctx.init(testing.allocator, &host);
+    defer ctx.deinit();
+    var rt = Runtime.init(testing.allocator);
+    defer rt.deinit();
+    rt.memory = try testing.allocator.alloc(u8, 64);
+    const mem = rt.memory;
+    var caller: Caller = .{ .rt = &rt, .host_data = &ctx };
+
+    @memcpy(mem[0..7], "log.txt");
+    try testing.expectEqual(wasi_p1.Errno.success, wasi_fd.pathOpen(&host, mem, dirfd, 0, 0, 7, 0, wasi_p1.RIGHTS_FD_WRITE | wasi_p1.RIGHTS_FD_SEEK, 0, 0, 8));
+    const desc = try ctx.resources.new(WasiP2Ctx.DESCRIPTOR_RT, std.mem.readInt(u32, mem[8..12], .little));
+    try p2DescriptorAppendViaStream(&caller, desc, 16);
+    try p2DescriptorAppendViaStream(&caller, desc, 24);
+    const first = std.mem.readInt(u32, mem[20..24], .little);
+    const second = std.mem.readInt(u32, mem[28..32], .little);
+
+    @memcpy(mem[32..34], "XY");
+    try p2OutStreamWrite(&caller, first, 32, 1, 40);
+    try testing.expectEqual(@as(u8, 0), mem[40]);
+    try p2OutStreamWrite(&caller, second, 33, 1, 40);
+    try testing.expectEqual(@as(u8, 0), mem[40]);
+    const got = try tmp.dir.readFileAlloc(io, "log.txt", testing.allocator, .limited(16));
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("abcXY", got);
+}
+
+test "without the network grant, 0.2 create-tcp-socket and start-listen answer access-denied" {
+    const testing = std.testing;
+    var host = try wasi_host.Host.init(testing.allocator);
+    defer host.deinit();
+    host.io = testing.io;
+    var ctx = try WasiP2Ctx.init(testing.allocator, &host);
+    defer ctx.deinit();
+    var eng = try Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var mod = try eng.compile("\x00asm\x01\x00\x00\x00\x05\x03\x01\x00\x01\x07\x0a\x01\x06memory\x02\x00");
+    defer mod.deinit();
+    var lk = eng.linker();
+    defer lk.deinit();
+    var inst = try lk.instantiate(&mod, .{});
+    defer inst.deinit();
+    ctx.mem_instance = &inst;
+    const mem = try ctx.memory();
+    var caller: Caller = .{ .rt = inst.handle.runtime.?, .host_data = &ctx };
+
+    try p2CreateTcpSocket(&caller, 0, 0);
+    try testing.expectEqual(@as(u8, 1), try mem.read(u8, 0));
+    try testing.expectEqual(@backingInt(p2sock.ErrorCode.access_denied), try mem.read(u8, 4));
+    host.allow_network = true;
+    try p2CreateTcpSocket(&caller, 0, 0);
+    try testing.expectEqual(@as(u8, 0), try mem.read(u8, 0));
+
+    // start-bind only records the address; the OS bind is start-listen's, so
+    // a grant revoked in between still stops it.
+    const tcp = try mem.read(u32, 4);
+    const net = try p2InstanceNetwork(&caller);
+    try p2TcpStartBind(&caller, tcp, net, 0, 0, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 16);
+    try p2TcpFinishBind(&caller, tcp, 16);
+    try testing.expectEqual(@as(u8, 0), try mem.read(u8, 16));
+    host.allow_network = false;
+    try p2TcpStartListen(&caller, tcp, 16);
+    try testing.expectEqual(@as(u8, 1), try mem.read(u8, 16));
+    try testing.expectEqual(@backingInt(p2sock.ErrorCode.access_denied), try mem.read(u8, 17));
+}
+
+test "0.2 descriptor.write / write-via-stream: an offset past the i64 range is invalid / closed" {
+    const Runtime = @import("../runtime/runtime.zig").Runtime;
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var host = try wasi_host.Host.init(testing.allocator);
+    defer host.deinit();
+    host.io = threaded.io();
+    const dirfd = try host.addPreopen(tmp.dir.handle, "/w");
+    var ctx = try WasiP2Ctx.init(testing.allocator, &host);
+    defer ctx.deinit();
+    var rt = Runtime.init(testing.allocator);
+    defer rt.deinit();
+    rt.memory = try testing.allocator.alloc(u8, 64);
+    const mem = rt.memory;
+    var caller: Caller = .{ .rt = &rt, .host_data = &ctx };
+
+    @memcpy(mem[0..5], "f.txt");
+    try testing.expectEqual(wasi_p1.Errno.success, wasi_fd.pathOpen(&host, mem, dirfd, 0, 0, 5, wasi_p1.OFLAGS_CREAT, wasi_p1.RIGHTS_FD_WRITE | wasi_p1.RIGHTS_FD_SEEK, 0, 0, 8));
+    const desc = try ctx.resources.new(WasiP2Ctx.DESCRIPTOR_RT, std.mem.readInt(u32, mem[8..12], .little));
+
+    try p2DescriptorWrite(&caller, desc, 0, 1, std.math.maxInt(u64), 16);
+    try testing.expectEqual(@as(u8, 1), mem[16]);
+    try testing.expectEqual(@backingInt(adapter.P2ErrorCode.invalid), mem[24]);
+    try p2DescriptorWriteViaStream(&caller, desc, std.math.maxInt(u64), 32);
+    try p2OutStreamWrite(&caller, std.mem.readInt(u32, mem[36..40], .little), 0, 1, 40);
+    try testing.expectEqual(@as(u8, 1), mem[40]); // err
+    try testing.expectEqual(@as(u8, 1), mem[44]); // stream-error::closed
+}
+
+test "0.2 via-stream: a dropped file stream's entry serves the next mint" {
+    const Runtime = @import("../runtime/runtime.zig").Runtime;
+    const testing = std.testing;
+    var host = try wasi_host.Host.init(testing.allocator);
+    defer host.deinit();
+    var ctx = try WasiP2Ctx.init(testing.allocator, &host);
+    defer ctx.deinit();
+    var rt = Runtime.init(testing.allocator);
+    defer rt.deinit();
+    rt.memory = try testing.allocator.alloc(u8, 16);
+    var caller: Caller = .{ .rt = &rt, .host_data = &ctx };
+    const desc = try ctx.resources.new(WasiP2Ctx.DESCRIPTOR_RT, 3);
+
+    try p2DescriptorReadViaStream(&caller, desc, 0, 0);
+    const first = std.mem.readInt(u32, rt.memory[4..8], .little);
+    try p2ResourceDrop(&caller, first);
+    try testing.expectError(WasiP2Error.InvalidHandle, ctxFileStream(&ctx, 0));
+    try p2DescriptorWriteViaStream(&caller, desc, 0, 0);
+    try testing.expectEqual(@as(usize, 1), ctx.file_streams.items.len);
+    _ = try ctxFileStream(&ctx, 0);
+}
+
+test "0.2 subscribe-duration: the pollable is not ready before its deadline, and block waits for it (#621)" {
+    const Runtime = @import("../runtime/runtime.zig").Runtime;
+    const testing = std.testing;
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var host = try wasi_host.Host.init(testing.allocator);
+    defer host.deinit();
+    host.io = threaded.io();
+    var ctx = try WasiP2Ctx.init(testing.allocator, &host);
+    defer ctx.deinit();
+    var rt = Runtime.init(testing.allocator);
+    defer rt.deinit();
+    var caller: Caller = .{ .rt = &rt, .host_data = &ctx };
+
+    const start = try monotonicNs(&ctx);
+    const p = try p2SubscribeDuration(&caller, 20 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(u32, 0), try p2PollableReady(&caller, p));
+    try p2PollableBlock(&caller, p);
+    try testing.expect(try monotonicNs(&ctx) - start >= 20 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(u32, 1), try p2PollableReady(&caller, p));
+}
+
+test "0.2 subscribe-instant: a past instant is ready at once, and a dropped pollable's entry serves the next mint (#621)" {
+    const Runtime = @import("../runtime/runtime.zig").Runtime;
+    const testing = std.testing;
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var host = try wasi_host.Host.init(testing.allocator);
+    defer host.deinit();
+    host.io = threaded.io();
+    var ctx = try WasiP2Ctx.init(testing.allocator, &host);
+    defer ctx.deinit();
+    var rt = Runtime.init(testing.allocator);
+    defer rt.deinit();
+    var caller: Caller = .{ .rt = &rt, .host_data = &ctx };
+
+    const start = try monotonicNs(&ctx);
+    const p = try p2SubscribeInstant(&caller, start - 1);
+    try testing.expectEqual(@as(u32, 1), try p2PollableReady(&caller, p));
+    try p2PollableBlock(&caller, p);
+    try testing.expect(try monotonicNs(&ctx) - start < 200 * std.time.ns_per_ms);
+
+    try p2ResourceDrop(&caller, p);
+    _ = try p2SubscribeInstant(&caller, start);
+    try testing.expectEqual(@as(usize, 1), ctx.clock_deadlines.items.len);
+}
+
+test "0.2 poll: of two clock pollables, only the earlier deadline is reported, at that deadline (#621)" {
+    const testing = std.testing;
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, "test/component/greet_core.wasm", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    var eng = try Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var mod = try eng.compile(bytes);
+    defer mod.deinit();
+    var lk = eng.linker();
+    defer lk.deinit();
+    var inst = try lk.instantiate(&mod, .{});
+    defer inst.deinit();
+    var host = try wasi_host.Host.init(testing.allocator);
+    defer host.deinit();
+    host.io = io;
+    var ctx = try WasiP2Ctx.init(testing.allocator, &host);
+    defer ctx.deinit();
+    ctx.realloc_instance = &inst; // poll's list<u32> comes from the guest's cabi_realloc
+    ctx.mem_instance = &inst;
+    var caller: Caller = .{ .rt = inst.handle.runtime.?, .host_data = &ctx };
+    const mem = inst.memory().?;
+
+    const start = try monotonicNs(&ctx);
+    try mem.write(@as(u32, 64), try p2SubscribeDuration(&caller, 40 * std.time.ns_per_ms));
+    try mem.write(@as(u32, 68), try p2SubscribeDuration(&caller, 10 * std.time.ns_per_ms));
+    try p2Poll(&caller, 64, 2, 16);
+    const elapsed = try monotonicNs(&ctx) - start;
+    try testing.expectEqual(@as(u32, 1), try mem.read(u32, 20));
+    try testing.expectEqual(@as(u32, 1), try mem.read(u32, try mem.read(u32, 16)));
+    try testing.expect(elapsed >= 10 * std.time.ns_per_ms);
+    try testing.expect(elapsed < 200 * std.time.ns_per_ms); // 40 ms is the bound; the rest is room for a lagging CI runner
+}
+
 /// True if `inst` exports a function named `name`.
 fn instanceExportsFunc(inst: *Instance, name: []const u8) bool {
     for (inst.handle.exports_storage) |e| {
@@ -586,15 +822,16 @@ pub fn p2DescriptorOpenAt(caller: *Caller, self_handle: u32, path_flags: u32, pa
     // the parent's inheriting set.
     const rights = wasi_p1.rightsForRightlessOpen(oflags);
     // pathOpen writes the opened fd to retptr+4; reuse that slot for the result payload.
-    const errno = wasi_fd.pathOpen(ctx.host, mem.slice(), dirfd, 0, path_ptr, path_len, oflags, rights.base, rights.inheriting, 0, retptr + 4);
+    const payload_ptr = std.math.add(u32, retptr, 4) catch return error.OutOfBoundsStore;
+    const errno = wasi_fd.pathOpen(ctx.host, mem.slice(), dirfd, 0, path_ptr, path_len, oflags, rights.base, rights.inheriting, 0, payload_ptr);
     if (errno != .success) {
         try writeP1Err(mem, retptr, 4, errno);
         return;
     }
-    const opened_fd = try mem.read(u32, retptr + 4);
+    const opened_fd = try mem.read(u32, payload_ptr);
     const handle = try ctx.resources.new(WasiP2Ctx.DESCRIPTOR_RT, opened_fd);
     try mem.write(retptr, @as(u8, 0)); // result disc: ok
-    try mem.write(retptr + 4, handle); // own<descriptor>
+    try mem.write(payload_ptr, handle); // own<descriptor>
 }
 
 /// `wasi:filesystem/preopens` `get-directories` (retptr): build a
@@ -608,7 +845,7 @@ pub fn p2GetDirectories(caller: *Caller, retptr: u32) WasiP2Error!void {
     const preopens = ctx.host.preopens;
     const n: u32 = @intCast(preopens.len);
     // Each list element is a tuple (descriptor handle i32, str_ptr i32, str_len i32) = 12 bytes.
-    const list_ptr: u32 = if (n == 0) 0 else try ctx.reallocGuest(n * 12, 4);
+    const list_ptr: u32 = if (n == 0) 0 else try ctx.reallocGuestArray(n, 12, 4);
     for (preopens, 0..) |p, i| {
         const wfd = preopenWasiFd(ctx.host, p.host_fd) orelse return WasiP2Error.WriteFailed;
         const handle = try ctx.resources.new(WasiP2Ctx.DESCRIPTOR_RT, wfd);
@@ -631,7 +868,7 @@ pub fn p2GetDirectories(caller: *Caller, retptr: u32) WasiP2Error!void {
 fn p2OutStreamFlush(caller: *Caller, self_handle: u32, retptr: u32) WasiP2Error!void {
     const ctx = caller.data(WasiP2Ctx);
     const h = try ctx.resources.peek(self_handle); // validate handle (fd or socket stream)
-    if (h.rt != WasiP2Ctx.OUTPUT_STREAM_RT and h.rt != WasiP2Ctx.SOCK_OUTPUT_STREAM_RT and h.rt != WasiP2Ctx.FILE_OUTPUT_STREAM_RT)
+    if (h.rt != WasiP2Ctx.OUTPUT_STREAM_RT and h.rt != WasiP2Ctx.SOCK_OUTPUT_STREAM_RT and h.rt != WasiP2Ctx.FILE_OUTPUT_STREAM_RT and h.rt != WasiP2Ctx.HTTP_BODY_OUT_RT)
         return resource_table.Error.TypeMismatch;
     const mem = try ctxMemory(caller);
     try mem.write(retptr, @as(u8, 0)); // result disc: ok (nothing buffered at this layer)
@@ -731,7 +968,7 @@ fn p2DescriptorStatAt(caller: *Caller, self_handle: u32, path_flags: u32, path_p
 /// descriptor methods).
 fn writeP1Err(mem: Memory, retptr: u32, off: u32, errno: wasi_p1.Errno) WasiP2Error!void {
     try mem.write(retptr, @as(u8, 1));
-    try mem.write(retptr + off, @intFromEnum(adapter.errnoToP2ErrorCode(errno)));
+    try mem.write(retptr + off, @backingInt(adapter.errnoToP2ErrorCode(errno)));
 }
 
 /// Store a `result<_, error-code>` at `retptr` — disc@0, error-code payload@1
@@ -855,34 +1092,37 @@ fn p2DescriptorReadDirectory(caller: *Caller, self_handle: u32, retptr: u32) Was
 
 /// `wasi:filesystem/types` `[method]descriptor.read-via-stream` /
 /// `write-via-stream` (self, offset, retptr) and `append-via-stream` (self,
-/// retptr): mint a stream over `self`'s fd that starts at `offset` (append: at
-/// the file's size, as the 0.3 host does) and store `result<own<stream>,
-/// error-code>` (ok handle@+4) at `retptr`.
+/// retptr): mint a stream over `self`'s fd that starts at `offset` (append:
+/// writes at the file's end as of each write, as O_APPEND does) and store
+/// `result<own<stream>, error-code>` (ok handle@+4) at `retptr`.
 fn p2DescriptorReadViaStream(caller: *Caller, self_handle: u32, offset: u64, retptr: u32) WasiP2Error!void {
     const ctx = caller.data(WasiP2Ctx);
     const fd: wasi_p1.Fd = @intCast(try ctx.resources.rep(WasiP2Ctx.DESCRIPTOR_RT, self_handle));
-    return mintFileStream(ctx, try ctxMemory(caller), WasiP2Ctx.FILE_INPUT_STREAM_RT, fd, offset, retptr);
+    return mintFileStream(ctx, try ctxMemory(caller), WasiP2Ctx.FILE_INPUT_STREAM_RT, .{ .fd = fd, .pos = offset }, retptr);
 }
 
 fn p2DescriptorWriteViaStream(caller: *Caller, self_handle: u32, offset: u64, retptr: u32) WasiP2Error!void {
     const ctx = caller.data(WasiP2Ctx);
     const fd: wasi_p1.Fd = @intCast(try ctx.resources.rep(WasiP2Ctx.DESCRIPTOR_RT, self_handle));
-    return mintFileStream(ctx, try ctxMemory(caller), WasiP2Ctx.FILE_OUTPUT_STREAM_RT, fd, offset, retptr);
+    return mintFileStream(ctx, try ctxMemory(caller), WasiP2Ctx.FILE_OUTPUT_STREAM_RT, .{ .fd = fd, .pos = offset }, retptr);
 }
 
 fn p2DescriptorAppendViaStream(caller: *Caller, self_handle: u32, retptr: u32) WasiP2Error!void {
     const ctx = caller.data(WasiP2Ctx);
     const fd: wasi_p1.Fd = @intCast(try ctx.resources.rep(WasiP2Ctx.DESCRIPTOR_RT, self_handle));
-    const mem = try ctxMemory(caller);
-    switch (try descriptorFilestat(ctx, mem, fd)) {
-        .ok => |st| try mintFileStream(ctx, mem, WasiP2Ctx.FILE_OUTPUT_STREAM_RT, fd, st.size, retptr),
-        .err => |errno| try writeP1Err(mem, retptr, 4, errno),
-    }
+    return mintFileStream(ctx, try ctxMemory(caller), WasiP2Ctx.FILE_OUTPUT_STREAM_RT, .{ .fd = fd, .pos = 0, .append = true }, retptr);
 }
 
-fn mintFileStream(ctx: *WasiP2Ctx, mem: Memory, rt: u32, fd: wasi_p1.Fd, pos: u64, retptr: u32) WasiP2Error!void {
-    const index: u32 = @intCast(ctx.file_streams.items.len);
-    ctx.file_streams.append(ctx.alloc, .{ .fd = fd, .pos = pos }) catch return WasiP2Error.OutOfMemory;
+fn mintFileStream(ctx: *WasiP2Ctx, mem: Memory, rt: u32, stream: WasiP2Ctx.FileStream, retptr: u32) WasiP2Error!void {
+    const index: u32 = for (ctx.file_streams.items, 0..) |s, i| {
+        if (s.dropped) {
+            ctx.file_streams.items[i] = stream;
+            break @intCast(i);
+        }
+    } else blk: {
+        ctx.file_streams.append(ctx.alloc, stream) catch return WasiP2Error.OutOfMemory;
+        break :blk @intCast(ctx.file_streams.items.len - 1);
+    };
     const handle = try ctx.resources.new(rt, index);
     try mem.write(retptr, @as(u8, 0)); // result disc: ok
     try mem.write(retptr + 4, handle);
@@ -934,7 +1174,7 @@ fn p2DirEntryStreamReadEntry(caller: *Caller, self_handle: u32, retptr: u32) Was
         }
         try mem.write(retptr, @as(u8, 0)); // result disc: ok
         try mem.write(retptr + 4, @as(u8, 1)); // option disc: some
-        try mem.write(retptr + 8, filetypeToDescriptorType(@enumFromInt(d_type)));
+        try mem.write(retptr + 8, filetypeToDescriptorType(@fromBackingInt(@intCast(d_type))));
         try mem.write(retptr + 12, name_ptr); // directory-entry.name ptr
         try mem.write(retptr + 16, d_namlen); // directory-entry.name len
         return;
@@ -1004,13 +1244,13 @@ fn p2DescriptorRead(caller: *Caller, self_handle: u32, length: u64, offset: u64,
 //
 // A synchronous host answers a pollable ready at once (POLLABLE_RT, rep
 // unused) unless its source can wait: a socket stream (SOCK_POLLABLE_RT,
-// ADR-0180) and stdin (STDIN_POLLABLE_RT) answer from the host fd, and `block`
-// / `poll` sleep in 2 ms steps until one is ready. Only a socket gives up, after
-// 30 s; stdin waits as long as `blocking-read` would. A clock pollable ignores
-// its deadline and is always ready.
+// ADR-0180) and stdin (STDIN_POLLABLE_RT) answer from the host fd, a clock
+// (CLOCK_POLLABLE_RT) from its deadline on the monotonic clock, and `block` /
+// `poll` sleep in 2 ms steps until one is ready. Only a socket gives up, after
+// 30 s; stdin waits as long as `blocking-read` would, a clock until its deadline.
 
-/// `wasi:io/streams`/`wasi:clocks` `subscribe*` → mint a pollable handle for
-/// `self`'s source; see the readiness rule above.
+/// `wasi:io/streams` `subscribe` → mint a pollable handle for `self`'s source;
+/// see the readiness rule above.
 fn p2Subscribe(caller: *Caller, self_handle: u32) WasiP2Error!u32 {
     const ctx = caller.data(WasiP2Ctx);
     const h = ctx.resources.peek(self_handle) catch return ctx.resources.new(WasiP2Ctx.POLLABLE_RT, 0);
@@ -1036,38 +1276,62 @@ fn sockPollableReady(ctx: *WasiP2Ctx, rep: u32) bool {
 }
 
 /// Whether the pollable `h` is ready now, or null when `h` is not a pollable.
-fn pollableReady(ctx: *WasiP2Ctx, h: resource_table.ResourceHandle) ?bool {
+fn pollableReady(ctx: *WasiP2Ctx, h: resource_table.ResourceHandle) WasiP2Error!?bool {
     return switch (h.rt) {
         WasiP2Ctx.POLLABLE_RT => true,
         WasiP2Ctx.SOCK_POLLABLE_RT => sockPollableReady(ctx, h.rep),
         WasiP2Ctx.STDIN_POLLABLE_RT => wasi_fd.stdinReady(ctx.host),
+        WasiP2Ctx.CLOCK_POLLABLE_RT => try monotonicNs(ctx) >= ctx.clock_deadlines.items[h.rep].deadline_ns,
         else => null,
     };
 }
 
-/// `wasi:clocks/monotonic-clock` `subscribe-instant`/`subscribe-duration`
-/// (when: u64) → pollable. Same always-ready handle; the deadline is ignored.
-fn p2SubscribeClock(caller: *Caller, _: u64) WasiP2Error!u32 {
+/// Whether `block` / `poll` give up on `h` after 30 s (see the readiness rule).
+fn pollableCapped(h: resource_table.ResourceHandle) bool {
+    return h.rt != WasiP2Ctx.STDIN_POLLABLE_RT and h.rt != WasiP2Ctx.CLOCK_POLLABLE_RT;
+}
+
+/// `wasi:clocks/monotonic-clock` `subscribe-instant(when: instant)` → pollable.
+fn p2SubscribeInstant(caller: *Caller, when: u64) WasiP2Error!u32 {
+    return mintClockPollable(caller.data(WasiP2Ctx), when);
+}
+
+/// `wasi:clocks/monotonic-clock` `subscribe-duration(when: duration)` → pollable.
+fn p2SubscribeDuration(caller: *Caller, when: u64) WasiP2Error!u32 {
     const ctx = caller.data(WasiP2Ctx);
-    return ctx.resources.new(WasiP2Ctx.POLLABLE_RT, 0);
+    return mintClockPollable(ctx, try monotonicNs(ctx) +| when);
+}
+
+fn mintClockPollable(ctx: *WasiP2Ctx, deadline_ns: u64) WasiP2Error!u32 {
+    const entry: WasiP2Ctx.ClockDeadline = .{ .deadline_ns = deadline_ns };
+    const index: u32 = for (ctx.clock_deadlines.items, 0..) |d, i| {
+        if (d.dropped) {
+            ctx.clock_deadlines.items[i] = entry;
+            break @intCast(i);
+        }
+    } else blk: {
+        ctx.clock_deadlines.append(ctx.alloc, entry) catch return WasiP2Error.OutOfMemory;
+        break :blk @intCast(ctx.clock_deadlines.items.len - 1);
+    };
+    return ctx.resources.new(WasiP2Ctx.CLOCK_POLLABLE_RT, index);
 }
 
 /// `wasi:io/poll` `[method]pollable.ready` (self) -> bool.
 fn p2PollableReady(caller: *Caller, self_handle: u32) WasiP2Error!u32 {
     const ctx = caller.data(WasiP2Ctx);
     const h = try ctx.resources.peek(self_handle);
-    return @intFromBool(pollableReady(ctx, h) orelse return resource_table.Error.TypeMismatch);
+    return @intFromBool(try pollableReady(ctx, h) orelse return resource_table.Error.TypeMismatch);
 }
 
 /// `wasi:io/poll` `[method]pollable.block` (self): wait until `self` is ready.
 fn p2PollableBlock(caller: *Caller, self_handle: u32) WasiP2Error!void {
     const ctx = caller.data(WasiP2Ctx);
     const h = try ctx.resources.peek(self_handle);
-    if (pollableReady(ctx, h) orelse return resource_table.Error.TypeMismatch) return;
+    if (try pollableReady(ctx, h) orelse return resource_table.Error.TypeMismatch) return;
     const io = try ctxIo(ctx);
-    const capped = h.rt != WasiP2Ctx.STDIN_POLLABLE_RT;
+    const capped = pollableCapped(h);
     var waited: u32 = 0;
-    while (!pollableReady(ctx, h).? and (!capped or waited < 30_000)) : (waited +|= 2) {
+    while (!(try pollableReady(ctx, h)).? and (!capped or waited < 30_000)) : (waited +|= 2) {
         io.sleep(.{ .nanoseconds = 2 * std.time.ns_per_ms }, .awake) catch break;
     }
 }
@@ -1079,18 +1343,18 @@ fn p2PollableBlock(caller: *Caller, self_handle: u32) WasiP2Error!void {
 fn p2Poll(caller: *Caller, in_ptr: u32, in_len: u32, retptr: u32) WasiP2Error!void {
     const ctx = caller.data(WasiP2Ctx);
     const mem = try ctxMemory(caller);
-    const data_ptr: u32 = if (in_len == 0) 0 else try ctx.reallocGuest(in_len * 4, 4);
+    const data_ptr: u32 = if (in_len == 0) 0 else try ctx.reallocGuestArray(in_len, 4, 4);
     var waited: u32 = 0;
     while (true) {
         var ready_n: u32 = 0;
         var capped = true;
         var i: u32 = 0;
         while (i < in_len) : (i += 1) {
-            const h = try ctx.resources.peek(try mem.read(u32, in_ptr + i * 4));
-            const is_ready = pollableReady(ctx, h) orelse return resource_table.Error.TypeMismatch;
-            if (h.rt == WasiP2Ctx.STDIN_POLLABLE_RT) capped = false;
+            const h = try ctx.resources.peek(try mem.readElem(u32, in_ptr, i));
+            const is_ready = try pollableReady(ctx, h) orelse return resource_table.Error.TypeMismatch;
+            if (!pollableCapped(h)) capped = false;
             if (is_ready) {
-                try mem.write(data_ptr + ready_n * 4, i);
+                try mem.writeElem(data_ptr, ready_n, i);
                 ready_n += 1;
             }
         }
@@ -1132,7 +1396,7 @@ fn p2GetArguments(caller: *Caller, retptr: u32) WasiP2Error!void {
     const mem = try ctxMemory(caller);
     const args = ctx.host.args;
     const n: u32 = @intCast(args.len);
-    const list_ptr: u32 = if (n == 0) 0 else try ctx.reallocGuest(n * 8, 4);
+    const list_ptr: u32 = if (n == 0) 0 else try ctx.reallocGuestArray(n, 8, 4);
     for (args, 0..) |arg, i| {
         const str = try allocGuestString(ctx, mem, arg);
         const elem = list_ptr + @as(u32, @intCast(i)) * 8;
@@ -1150,7 +1414,7 @@ fn p2GetEnvironment(caller: *Caller, retptr: u32) WasiP2Error!void {
     const mem = try ctxMemory(caller);
     const envs = ctx.host.envs;
     const n: u32 = @intCast(envs.len);
-    const list_ptr: u32 = if (n == 0) 0 else try ctx.reallocGuest(n * 16, 4);
+    const list_ptr: u32 = if (n == 0) 0 else try ctx.reallocGuestArray(n, 16, 4);
     for (envs, 0..) |e, i| {
         const k = try allocGuestString(ctx, mem, e.key);
         const v = try allocGuestString(ctx, mem, e.value);
@@ -1203,15 +1467,15 @@ fn p2CheckWrite(caller: *Caller, self_handle: u32, retptr: u32) WasiP2Error!void
         try mem.write(retptr + 8, @as(u64, if (writable) 4096 else 0));
         return;
     }
-    if (h.rt != WasiP2Ctx.OUTPUT_STREAM_RT and h.rt != WasiP2Ctx.FILE_OUTPUT_STREAM_RT) return resource_table.Error.TypeMismatch;
+    if (h.rt != WasiP2Ctx.OUTPUT_STREAM_RT and h.rt != WasiP2Ctx.FILE_OUTPUT_STREAM_RT and h.rt != WasiP2Ctx.HTTP_BODY_OUT_RT) return resource_table.Error.TypeMismatch;
     try mem.write(retptr, @as(u8, 0)); // result disc: ok
     try mem.write(retptr + 8, @as(u64, 4096)); // bytes the guest may write now
 }
 
 // ---- wasi:sockets (ADR-0180 Phase 1) ----
 
-/// `wasi:sockets/instance-network` `instance-network()` -> the ambient
-/// network singleton resource.
+/// `wasi:sockets/instance-network` `instance-network()` -> the network
+/// singleton resource (minted with or without the grant).
 fn p2InstanceNetwork(caller: *Caller) WasiP2Error!u32 {
     const ctx = caller.data(WasiP2Ctx);
     return ctx.resources.new(WasiP2Ctx.NETWORK_RT, 0);
@@ -1223,6 +1487,7 @@ fn p2InstanceNetwork(caller: *Caller) WasiP2Error!u32 {
 fn p2CreateTcpSocket(caller: *Caller, family: u32, retptr: u32) WasiP2Error!void {
     const ctx = caller.data(WasiP2Ctx);
     const mem = try ctxMemory(caller);
+    ctxRequireNetwork(ctx) catch |e| return writeSockErr(mem, retptr, 4, e);
     const fam: p2sock.AddressFamily = if (family == 0) .ipv4 else .ipv6;
     const idx: u32 = @intCast(ctx.tcp_sockets.items.len);
     ctx.tcp_sockets.append(ctx.alloc, p2sock.TcpSocket.create(fam)) catch return WasiP2Error.OutOfMemory;
@@ -1235,7 +1500,7 @@ fn p2CreateTcpSocket(caller: *Caller, family: u32, retptr: u32) WasiP2Error!void
 /// params; ipv4 uses p0..p4, ipv6 all 11) into a host `IpAddress`.
 fn writeSockErr(mem: Memory, retptr: u32, off: u32, e: anyerror) WasiP2Error!void {
     try mem.write(retptr, @as(u8, 1));
-    try mem.write(retptr + off, @intFromEnum(p2sock.errorToCode(e)));
+    try mem.write(retptr + off, @backingInt(p2sock.errorToCode(e)));
 }
 
 /// Store a `result<_, error-code>` for a sockets op at `retptr` (disc@0,
@@ -1252,6 +1517,7 @@ fn p2TcpStartBind(caller: *Caller, self: u32, network: u32, disc: u32, p0: u32, 
     const mem = try ctxMemory(caller);
     _ = try ctx.resources.rep(WasiP2Ctx.NETWORK_RT, network);
     const sock = try ctxTcpSocket(ctx, try ctx.resources.rep(WasiP2Ctx.TCP_SOCKET_RT, self));
+    ctxRequireNetwork(ctx) catch |e| return writeSockUnitResult(mem, retptr, e);
     const addr = decodeIpSocketAddress(disc, .{ p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10 }) orelse
         return writeSockUnitResult(mem, retptr, error.InvalidArgument);
     sock.startBind(try ctxIo(ctx), addr) catch |e| return writeSockUnitResult(mem, retptr, e);
@@ -1273,6 +1539,7 @@ fn p2TcpStartConnect(caller: *Caller, self: u32, network: u32, disc: u32, p0: u3
     const mem = try ctxMemory(caller);
     _ = try ctx.resources.rep(WasiP2Ctx.NETWORK_RT, network);
     const sock = try ctxTcpSocket(ctx, try ctx.resources.rep(WasiP2Ctx.TCP_SOCKET_RT, self));
+    ctxRequireNetwork(ctx) catch |e| return writeSockUnitResult(mem, retptr, e);
     const addr = decodeIpSocketAddress(disc, .{ p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10 }) orelse
         return writeSockUnitResult(mem, retptr, error.InvalidArgument);
     sock.startConnect(try ctxIo(ctx), addr) catch |e| return writeSockUnitResult(mem, retptr, e);
@@ -1330,6 +1597,7 @@ fn p2TcpStartListen(caller: *Caller, self: u32, retptr: u32) WasiP2Error!void {
     const ctx = caller.data(WasiP2Ctx);
     const mem = try ctxMemory(caller);
     const sock = try ctxTcpSocket(ctx, try ctx.resources.rep(WasiP2Ctx.TCP_SOCKET_RT, self));
+    ctxRequireNetwork(ctx) catch |e| return writeSockUnitResult(mem, retptr, e);
     sock.startListen(try ctxIo(ctx)) catch |e| return writeSockUnitResult(mem, retptr, e);
     try writeSockUnitResult(mem, retptr, null);
 }
@@ -1403,7 +1671,7 @@ fn p2TcpRemoteAddress(caller: *Caller, self: u32, retptr: u32) WasiP2Error!void 
 fn sockStubWriteErr(caller: *Caller, retptr: u32, comptime off: u32) WasiP2Error!void {
     const mem = try ctxMemory(caller);
     try mem.write(retptr, @as(u8, 1));
-    try mem.write(retptr + off, @intFromEnum(p2sock.ErrorCode.not_supported));
+    try mem.write(retptr + off, @backingInt(p2sock.ErrorCode.not_supported));
 }
 
 fn p2SockStubUnit2(caller: *Caller, _: u32, retptr: u32) WasiP2Error!void {
@@ -1445,7 +1713,7 @@ fn p2SockStubSend(caller: *Caller, _: u32, _: u32, _: u32, retptr: u32) WasiP2Er
 fn p2FsStubGetFlags(caller: *Caller, _: u32, retptr: u32) WasiP2Error!void {
     const mem = try ctxMemory(caller);
     try mem.write(retptr, @as(u8, 1));
-    try mem.write(retptr + 1, @intFromEnum(adapter.P2ErrorCode.unsupported));
+    try mem.write(retptr + 1, @backingInt(adapter.P2ErrorCode.unsupported));
 }
 
 /// `wasi:filesystem/types` `filesystem-error-code(err: borrow<error>)` ->
@@ -1545,7 +1813,8 @@ fn defineClassifiedFunc(lk: *Linker, module: []const u8, name: []const u8, op: a
         .poll_pollable_block => try defineMapped(lk, module, name, ctx, fn (*Caller, u32) WasiP2Error!void, p2PollableBlock, mapGuestFault),
         .poll_poll => try defineMapped(lk, module, name, ctx, fn (*Caller, u32, u32, u32) WasiP2Error!void, p2Poll, mapGuestFault),
         .in_stream_subscribe, .out_stream_subscribe => try defineMapped(lk, module, name, ctx, fn (*Caller, u32) WasiP2Error!u32, p2Subscribe, mapGuestFault),
-        .clocks_subscribe_instant, .clocks_subscribe_duration => try defineMapped(lk, module, name, ctx, fn (*Caller, u64) WasiP2Error!u32, p2SubscribeClock, mapGuestFault),
+        .clocks_subscribe_instant => try defineMapped(lk, module, name, ctx, fn (*Caller, u64) WasiP2Error!u32, p2SubscribeInstant, mapGuestFault),
+        .clocks_subscribe_duration => try defineMapped(lk, module, name, ctx, fn (*Caller, u64) WasiP2Error!u32, p2SubscribeDuration, mapGuestFault),
         .cli_get_environment => try defineMapped(lk, module, name, ctx, fn (*Caller, u32) WasiP2Error!void, p2GetEnvironment, mapGuestFault),
         .cli_get_arguments => try defineMapped(lk, module, name, ctx, fn (*Caller, u32) WasiP2Error!void, p2GetArguments, mapGuestFault),
         .cli_initial_cwd => try defineMapped(lk, module, name, ctx, fn (*Caller, u32) WasiP2Error!void, p2ReturnNone, mapGuestFault),
@@ -1575,6 +1844,7 @@ fn defineClassifiedFunc(lk: *Linker, module: []const u8, name: []const u8, op: a
             if (try p3h.registerP3Arms(lk, module, name, op, ctx)) return;
             return error.UnsupportedWasiImport;
         },
+        .http2_fields_from_list, .http2_fields_set, .http2_fields_delete, .http2_fields_append, .http2_outgoing_request_new, .http2_outgoing_request_body, .http2_reqopts_connect_set, .http2_reqopts_first_byte_set, .http2_reqopts_between_bytes_set, .http2_outgoing_body_write, .http2_outgoing_body_finish, .http2_handle, .http2_future_subscribe, .http2_future_response_get, .http2_incoming_response_consume, .http2_incoming_body_stream, .http2_incoming_body_finish, .http2_future_trailers_get, .http2_http_error_code => try p2http.defineHttp2Op(lk, module, name, op, ctx),
         .fs_read_via_stream => try defineMapped(lk, module, name, ctx, fn (*Caller, u32, u64, u32) WasiP2Error!void, p2DescriptorReadViaStream, mapGuestFault),
         .fs_write_via_stream => try defineMapped(lk, module, name, ctx, fn (*Caller, u32, u64, u32) WasiP2Error!void, p2DescriptorWriteViaStream, mapGuestFault),
         .fs_append_via_stream => try defineMapped(lk, module, name, ctx, fn (*Caller, u32, u32) WasiP2Error!void, p2DescriptorAppendViaStream, mapGuestFault),
@@ -1624,13 +1894,40 @@ fn nthCoreModule(decoded: *const decode.Component, n: u32) ?[]const u8 {
     return null;
 }
 
-/// The (first) `canon lift`'s underlying core-instance export — the lowered
-/// `run` the host invokes (resolved through the unified core-func index space).
-fn firstLiftCoreExport(info: *const ctypes.TypeInfo) ?ctypes.TypeInfo.CoreExportRef {
-    for (info.canons.items) |c| {
-        if (c == .lift) return info.resolveCoreFuncExport(c.lift.core_func);
+const CommandEntry = struct { lift: ctypes.Lift, has_result: bool };
+
+/// The command entry under `zwasm run` (ADR-0230): `wasi:cli/run@<gen>#run`
+/// by name, the highest generation first, else a top-level func export `run`,
+/// whatever else the component lifts. Its own lift says sync or async.
+fn commandEntry(alloc: Allocator, info: *const ctypes.TypeInfo) Allocator.Error!?CommandEntry {
+    const prefix = "wasi:cli/run@";
+    for ([_]ctypes.WasiGen{ .p3, .p2 }) |gen| {
+        for (info.exports.items) |e| {
+            if (std.meta.activeTag(e.sort) != .instance or !std.mem.startsWith(u8, e.name, prefix)) continue;
+            if (ctypes.parseWasiGen(e.name[prefix.len..]) != gen) continue;
+            const path = try alloc.print("{s}#run", .{e.name});
+            defer alloc.free(path);
+            return .{ .lift = info.exportedLift(path) orelse return null, .has_result = true };
+        }
     }
-    return null;
+    // A top-level `run` stands in for `wasi:cli/run`'s `func() -> result`, so
+    // it is the entry only as that or `func()`; any other shape is `--invoke`'s.
+    const ft = info.resolveFuncType("run") orelse return null;
+    if (ft.params.len != 0) return null;
+    if (ft.result) |r| if (!isBareResult(info, r)) return null;
+    return .{ .lift = info.exportedLift("run") orelse return null, .has_result = ft.result != null };
+}
+
+/// `result` with neither an `ok` nor an `err` payload.
+fn isBareResult(info: *const ctypes.TypeInfo, v: ctypes.ValType) bool {
+    if (v != .type_index or v.type_index >= info.type_space.items.len) return false;
+    return switch (info.type_space.items[v.type_index]) {
+        .def => |d| switch (info.deftypes.items[d]) {
+            .result => |rt| rt.ok == null and rt.err == null,
+            else => false,
+        },
+        .named => false,
+    };
 }
 
 // ============================================================
@@ -1717,18 +2014,18 @@ fn streamElemByteSize(arena: Allocator, info: *const ctypes.TypeInfo, type_index
     return if (sz == 0) 1 else @intCast(sz);
 }
 
-/// Record the first lower-side realloc (see `component_lower_realloc.zig`)
-/// whose instance is already built, as the trampolines' result allocator.
-fn bindLowerRealloc(ctx: *WasiP2Ctx, info: *const ctypes.TypeInfo, built: []const ?Built, ex: ctypes.CoreInlineExport) void {
-    if (ctx.lower_realloc_instance != null) return;
-    const ref = lower_realloc.lowerReallocRef(info, ex) orelse return;
-    if (ref.instance >= built.len) return;
-    switch (built[ref.instance] orelse return) {
+/// Bind the lowers' realloc (see `component_lower_realloc.zig`) as the
+/// trampolines' result allocator, once every core instance is built. A ref
+/// that does not land on a guest instance is refused, not skipped.
+fn bindLowerRealloc(ctx: *WasiP2Ctx, binding: lower_realloc.Binding, built: []const ?Built) lower_realloc.Error!void {
+    const ref = binding.ref orelse return;
+    if (ref.instance >= built.len) return lower_realloc.Error.UnsupportedLowerRealloc;
+    switch (built[ref.instance] orelse return lower_realloc.Error.UnsupportedLowerRealloc) {
         .guest => |gi| {
             ctx.lower_realloc_instance = gi;
             ctx.lower_realloc_name = ref.name;
         },
-        .synthetic => {},
+        .synthetic => return lower_realloc.Error.UnsupportedLowerRealloc,
     }
 }
 
@@ -1924,7 +2221,7 @@ fn defineSynth(lk: *Linker, ns: []const u8, e: SynthExport, ctx: *WasiP2Ctx) !vo
             const rt = g.inst.handle.runtime orelse return error.ImportUnsatisfied;
             for (g.inst.handle.exports_storage) |exp| {
                 if (exp.kind == .table and std.mem.eql(u8, exp.name, g.name)) {
-                    try lk.defineTable(ns, e.name, rt.tables[exp.idx]);
+                    try lk.defineTableInstance(ns, e.name, &rt.tables[exp.idx]);
                     return;
                 }
             }
@@ -2082,13 +2379,14 @@ pub fn buildWasiP2Component(engine: *Engine, alloc: Allocator, bytes: []const u8
         self.synth_arena.deinit();
     }
 
+    var lower_binding: lower_realloc.Binding = .{};
     for (cis, 0..) |ci, i| {
         self.built[i] = switch (ci) {
             .inline_exports => |exps| blk: {
                 const list = try self.synth_arena.allocator().alloc(SynthExport, exps.len);
                 var n: usize = 0;
                 for (exps) |ex| {
-                    bindLowerRealloc(ctx, &self.info, self.built, ex);
+                    try lower_binding.record(&self.info, ex);
                     const def = (try synthDef(self.synth_arena.allocator(), &self.info, self.built, ex)) orelse continue;
                     list[n] = .{ .name = ex.name, .def = def };
                     n += 1;
@@ -2131,6 +2429,7 @@ pub fn buildWasiP2Component(engine: *Engine, alloc: Allocator, bytes: []const u8
             },
         };
     }
+    try bindLowerRealloc(ctx, lower_binding, self.built);
 
     // Resolve guest-resource destructors (D-322): a resource deftype's
     // `dtor` is a core-func index — chase it to the exporting guest
@@ -2173,14 +2472,21 @@ pub fn runWasiP2Main(engine: *Engine, alloc: Allocator, bytes: []const u8, host:
     try runWasiP2MainBuilt(&built);
 }
 
-/// The post-build half of `runWasiP2Main` (the sync `wasi:cli/run` path):
-/// invoke the first `canon lift` export. Split out so the unified
-/// `runWasiMain` dispatcher (P3) can reuse it after building once.
+/// The post-build half of `runWasiP2Main` (the sync path): invoke the command
+/// entry (`commandEntry`); a component without one is `NoRunExport`.
 pub fn runWasiP2MainBuilt(built: *BuiltComponent) anyerror!void {
-    const run_ref = firstLiftCoreExport(&built.info) orelse return error.NoRunExport;
+    const entry = (try commandEntry(built.alloc, &built.info)) orelse return error.NoRunExport;
+    return runSyncEntry(built, entry);
+}
+
+fn runSyncEntry(built: *BuiltComponent, entry: CommandEntry) anyerror!void {
+    // Invoked sync, an async lift's packed return would read as its `result`.
+    if (entry.lift.opts.is_async) return error.AsyncEntryNeedsWasiP3;
+    const run_ref = built.info.resolveCoreFuncExport(entry.lift.core_func) orelse return error.NoRunExport;
     const main_inst = built.guestInstance(run_ref.instance) orelse return error.NoRunExport;
     var results = [_]Value{.{ .i32 = 0 }};
-    main_inst.invoke(run_ref.name, &.{}, &results) catch |err| {
+    const n_results: usize = @intFromBool(entry.has_result);
+    main_inst.invoke(run_ref.name, &.{}, results[0..n_results]) catch |err| {
         // wasi:cli/exit unwinds with ProcExit after recording host.exit_code —
         // a clean termination, not a failure.
         if (err == error.ProcExit) return;
@@ -2188,27 +2494,24 @@ pub fn runWasiP2MainBuilt(built: *BuiltComponent) anyerror!void {
     };
     // `run: func() -> result` — an `err` return (flat discriminant 1) is exit
     // code 1 per the wasi:cli command contract (official run-with-err.wasm).
-    if (results[0].i32 != 0 and built.ctx.host.exit_code == null) built.ctx.host.exit_code = 1;
+    if (entry.has_result and results[0].i32 != 0 and built.ctx.host.exit_code == null) built.ctx.host.exit_code = 1;
 }
 
-/// The unified WASI-component entry (D-335 Unit F): build once, then dispatch —
-/// an **async-lifted** export (a `canon lift` with `opts.is_async`) goes through
-/// the P3 stackless callback loop, else the sync `wasi:cli/run` path. This is
-/// the surface the CLI / embedders call so an async P3 component "just runs".
+/// The unified WASI-component entry (D-335 Unit F): build once, select the
+/// entry (`commandEntry`), then dispatch on its lift — async through the
+/// P3 stackless callback loop, sync through `runSyncEntry`. This is the
+/// surface the CLI / embedders call so an async P3 component "just runs".
 ///
 /// ADR-0193 P3: the async branch is `comptime build_options.enable_wasi_p3`-gated
 /// (relocated here from `component_wasi_p3.zig` so a `wasi_level < .p3` build
 /// never references the P3 driver — `component_wasi_p3.zig` is then unimported).
-/// At a p2 build an async component falls through to the sync runner, which
-/// surfaces `NoRunExport` if it has no sync `wasi:cli/run` export.
+/// At a p2 build an async entry is refused (`AsyncEntryNeedsWasiP3`).
 pub fn runWasiMain(engine: *Engine, alloc: Allocator, bytes: []const u8, host: *wasi_host.Host, opts: Module.InstantiateOpts) anyerror!void {
     var built = try buildWasiP2Component(engine, alloc, bytes, host, opts);
     defer built.deinit();
+    const entry = (try commandEntry(built.alloc, &built.info)) orelse return error.NoRunExport;
     if (comptime build_options.enable_wasi_p3) {
-        const cwasi3 = @import("component_wasi_p3.zig");
-        for (built.info.canons.items) |c| {
-            if (c == .lift and c.lift.opts.is_async) return cwasi3.driveAsyncMain(&built);
-        }
+        if (entry.lift.opts.is_async) return @import("component_wasi_p3.zig").driveAsyncCall(&built, entry.lift, &.{});
     }
-    return runWasiP2MainBuilt(&built);
+    return runSyncEntry(&built, entry);
 }

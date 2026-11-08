@@ -30,7 +30,14 @@ never calls it), never the entry's result; a trap exits 1 with its kind on
 stderr. A module with neither export is refused the same way (use `--invoke`).
 The same contract holds on every engine and on a `.cwasm` (CWAS magic, which
 loads + runs directly with no parse/compile); a shape the JIT cannot call is
-refused with the reason rather than silently skipped (ADR-0230).
+refused with the reason rather than silently skipped (ADR-0230). On a
+component the entry is its `wasi:cli/run` export's `run`, found by name, the
+highest generation first (`@0.3.x` over `@0.2.x`), else a top-level func export
+`run` (a zwasm convention, not a WASI one). The top-level `run` stands in for
+`wasi:cli/run`'s, whose type is `func() -> result`, so it is the entry only as
+that or `func()`; another shape is reached with `--invoke`. Either entry runs
+sync or async as it is lifted. A component without either is refused the same way, with its exports
+listed.
 
 Options go before the module path; everything after it is the guest's argv,
 even a token that spells a `run` option. `--` ends the options, for a module
@@ -38,10 +45,11 @@ path that begins with `-`.
 
 | Flag                       | Effect                                                                                                                                                                                                                                       |
 |----------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `--invoke <name>[=a,b,…]` | run the named export instead of `_start`/`main`. `=args` (comma-separated, parsed by param type i32/i64/f32/f64) supplies its parameters; typed results print bare, one per line, on stdout. Works on both the interpreter and the JIT (D-477) |
+| `--invoke <name>[=a,b,…]` | run the named export instead of `_start`/`main`. `=args` (comma-separated, parsed by param type i32/i64/f32/f64) supplies its parameters; typed results print bare, one per line, on stdout. Works on both the interpreter and the JIT (D-477). On a component the name is a func export's (`iface#func` inside an exported interface) and `=args` parse by WIT type — `bool`, `s8`…`u64`, `f32`, `f64`, `char`, `string` (the token as given; a string argument cannot contain a comma); any other param or result type, or an async export, is refused before the call |
 | `--engine <auto\|interp\|jit>` | default `auto` — prefers the JIT, falls back to the interpreter when the JIT declines the module (`--engine auto` is the explicit spelling of the same). `--engine interp` / `jit` force one. BOTH do full WASI; `jit` additionally executes SIMD-128                    |
 | `--dir <host>[:<guest>]`   | preopen a host directory for WASI (colon separator; guest path mirrors host when omitted)                                                                                                                                                    |
 | `--env KEY=VAL`            | set a WASI environment variable for the guest (repeatable; bare `KEY` sets empty)                                                                                                                                                            |
+| `--allow-network`          | let a component's `wasi:sockets` and `wasi:http` reach the host's network. Off by default: socket creation, bind / connect / listen / send and name lookup answer `access-denied`. A core module has no network API, so the flag changes nothing there              |
 | `--fuel <N>`               | trap (`all fuel consumed`) after a deterministic budget. Units are engine-specific by design: interp counts instructions, jit counts loop iterations + function entries (on x86_64 only a function that uses memory, a global, a call or an instruction that can trap) |
 | `--timeout <ms>`           | interrupt the guest (`interrupted` trap) after a wall-clock deadline — both engines                                                                                                                                                         |
 | `--max-memory <bytes>`     | refuse `memory.grow` past this many bytes (64 KiB page granularity); the spec `-1` failure, not a trap                                                                                                                                       |
@@ -77,8 +85,9 @@ WASI / sandbox / `--invoke` behaviour to running the source `.wasm`
   back to the interpreter when the JIT *declines* the module; a module the JIT
   judges *invalid* fails with the reason, on every engine — #233);
   `--engine auto` spells the default explicitly.
-  `--engine interp` forces the interpreter; `--engine jit` forces the JIT
-  (full WASI, plus SIMD execution).
+  `--engine interp` forces the interpreter, which refuses a SIMD module at
+  instantiate — as `auto` does one the JIT declines, naming both reasons;
+  `--engine jit` forces the JIT (full WASI, plus SIMD execution).
 - `--cache` affects `.wasm` runs only (a `.cwasm` input IS the artifact;
   components have no artifact format) and is bypassed under
   `--engine interp`.

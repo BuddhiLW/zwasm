@@ -58,9 +58,8 @@ const Error = ctx_mod.Error;
 // handler body references `sx10..sx12` instead of magic numerals so
 // `check_invariant_comments.sh` no longer counts them as latent
 // D-133-class overlap sites. emitMemoryInit only uses the
-// {X10, X11, X12} subset of {X9..X13}; the op_scratch_reservation_table
-// entry still names the full {0..4} set for forward-compatibility
-// with future bulk-memory ops needing more scratch.
+// {X9, X10, X11, X12} subset of {X9..X13}.
+const sx9: inst.Xn = abi.allocatable_caller_saved_scratch_gprs[0];
 const sx10: inst.Xn = abi.allocatable_caller_saved_scratch_gprs[1];
 const sx11: inst.Xn = abi.allocatable_caller_saved_scratch_gprs[2];
 const sx12: inst.Xn = abi.allocatable_caller_saved_scratch_gprs[3];
@@ -85,7 +84,7 @@ pub fn emitMemOp(ctx: *EmitCtx, ins: *const ZirInstr) Error!void {
     // the runtime check selects the i32 fast-path (byte-identical
     // to the legacy i32 emit, per emit_test_memory.zig assertions) or
     // the i64 wrap-check path.
-    if (comptime @intFromEnum(build_options.wasm_level) >= @intFromEnum(@TypeOf(build_options.wasm_level).v3_0)) {
+    if (comptime @backingInt(build_options.wasm_level) >= @backingInt(@TypeOf(build_options.wasm_level).v3_0)) {
         if (ctx.memory0_idx_type == .i64) {
             return emitMemOpI64(ctx, ins);
         }
@@ -680,7 +679,7 @@ pub fn emitMemoryFill(ctx: *EmitCtx) Error!void {
 /// D-324 — is this module's (single, memidx-0) memory i64-indexed?
 /// Comptime-pruned below v3.0, mirroring `emitMemOp`'s gate.
 inline fn bulkIs64(ctx: *EmitCtx) bool {
-    if (comptime @intFromEnum(build_options.wasm_level) >= @intFromEnum(@TypeOf(build_options.wasm_level).v3_0)) {
+    if (comptime @backingInt(build_options.wasm_level) >= @backingInt(@TypeOf(build_options.wasm_level).v3_0)) {
         return ctx.memory0_idx_type == .i64;
     }
     return false;
@@ -901,12 +900,8 @@ pub fn emitMemoryCopy(ctx: *EmitCtx) Error!void {
 ///   X9, X10, X12 = ad-hoc temps
 pub fn emitMemoryInit(ctx: *EmitCtx, ins: *const ZirInstr) Error!void {
     const dataidx: u32 = @intCast(ins.payload);
-    // imm12 budget: LDR X-form scaled byte_off ≤ 32760 → idx ≤ 2047
-    // (stride 16). LDRB imm12 ≤ 4095 → idx ≤ 4095. The 2047 bound
-    // is the tighter one. Validator already bounds idx vs the
-    // module's segment count; this guard only rejects encoding-
-    // budget overflow.
-    if (dataidx >= 2048) return Error.UnsupportedOp;
+    // `baseOffLarge` reaches byte offsets below 2^24: idx * 16.
+    if (dataidx >= (1 << 20)) return Error.UnsupportedOp;
 
     if (ctx.pushed_vregs.items.len < 3) return Error.AllocationMissing;
     const n_v = ctx.pushed_vregs.pop().?;
@@ -927,20 +922,23 @@ pub fn emitMemoryInit(ctx: *EmitCtx, ins: *const ZirInstr) Error!void {
 
     // Step B: read seg.ptr (X11) + seg.len (X15) from data_segments_ptr.
     //   LDR  X10, [X19, #data_segments_ptr_off]    ; seg table base
-    //   LDR  X11, [X10, #(idx*16)]                  ; seg.ptr
-    //   LDR  X15, [X10, #(idx*16)+8]                ; seg.len
-    const seg_byte_off: u15 = @intCast(@as(u32, dataidx) * 16);
+    //   (ADD X9, X10, #(idx*16 >> 12), LSL #12)    ; past the imm12 budget
+    //   LDR  X11, [X10|X9, #off]                    ; seg.ptr
+    //   LDR  X15, [X10|X9, #off+8]                  ; seg.len
     try gpr.writeU32(ctx.allocator, ctx.buf, inst.encLdrImm(sx10, abi.runtime_ptr_save_gpr, jit_abi.data_segments_ptr_off));
-    try gpr.writeU32(ctx.allocator, ctx.buf, inst.encLdrImm(sx11, 10, seg_byte_off));
-    try gpr.writeU32(ctx.allocator, ctx.buf, inst.encLdrImm(15, 10, seg_byte_off + 8));
+    const seg = try gpr.baseOffLarge(ctx.allocator, ctx.buf, sx10, sx9, dataidx * 16, gpr.max_frame_imm_off - 8);
+    try gpr.writeU32(ctx.allocator, ctx.buf, inst.encLdrImm(sx11, seg.base, @intCast(seg.off)));
+    try gpr.writeU32(ctx.allocator, ctx.buf, inst.encLdrImm(15, seg.base, @intCast(seg.off + 8)));
 
     // Step C: dropped flag override. If dropped == 1, seg.len → 0.
     //   LDR  X10, [X19, #data_dropped_ptr_off]
-    //   LDRB W12, [X10, #idx]
+    //   (ADD X9, X10, #(idx >> 12), LSL #12)
+    //   LDRB W12, [X10|X9, #off]
     //   CMP  W12, #0
     //   CSEL X15, X15, XZR, EQ      ; keep len when not dropped (W12==0)
     try gpr.writeU32(ctx.allocator, ctx.buf, inst.encLdrImm(sx10, abi.runtime_ptr_save_gpr, jit_abi.data_dropped_ptr_off));
-    try gpr.writeU32(ctx.allocator, ctx.buf, inst.encLdrbImm(sx12, 10, @intCast(dataidx)));
+    const flag = try gpr.baseOffLarge(ctx.allocator, ctx.buf, sx10, sx9, dataidx, 4095);
+    try gpr.writeU32(ctx.allocator, ctx.buf, inst.encLdrbImm(sx12, flag.base, @intCast(flag.off)));
     try gpr.writeU32(ctx.allocator, ctx.buf, inst.encCmpImmW(sx12, 0));
     try gpr.writeU32(ctx.allocator, ctx.buf, inst.encCselX(15, 15, 31, .eq));
 

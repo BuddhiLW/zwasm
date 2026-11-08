@@ -436,6 +436,7 @@ test {
     _ = @import("cli/run_prepared.zig");
     _ = @import("cli/cache.zig");
     _ = @import("cli/invoke_args.zig");
+    _ = @import("cli/component_entry.zig");
     _ = @import("feature/component/decode.zig");
     _ = @import("feature/component/types.zig");
     _ = @import("feature/component/types_tests.zig");
@@ -451,13 +452,14 @@ test {
     _ = @import("api/component_wasi_ctx.zig");
     _ = @import("api/component_wasi_p3_host.zig");
     _ = @import("api/component_wasi_p2.zig");
+    _ = @import("api/component_wasi_p2_http.zig");
     _ = @import("api/component_tests.zig");
     _ = @import("api/component_async_tests.zig");
     _ = @import("api/component_preview1_adapted_tests.zig");
     _ = @import("interp/frame_depth_tests.zig");
-    // ADR-0193 P3: the P3 driver + its 28 async tests compile only at
-    // `wasi_level >= .p3`. The default `.p2` `zig build test` skips them;
-    // the `test-wasi-p3` step (forced `-Dwasi=p3`) covers them.
+    // ADR-0193 P3: the P3 driver + its async tests compile only at
+    // `wasi_level >= .p3` (the default); `test-wasi-p2` covers the build
+    // without them.
     if (@import("build_options").enable_wasi_p3) _ = @import("api/component_wasi_p3.zig");
     _ = @import("api/component_typed.zig");
 }
@@ -981,7 +983,7 @@ test "zwasm facade T1.13: Linker.defineWasi smoke instantiation" {
 
 test "zwasm facade T1.4-types: Instance.invoke return type carries all 12 Trap variants" {
     const InvokeError = Instance.InvokeError;
-    const info = @typeInfo(InvokeError).error_set orelse @compileError("expected concrete error_set");
+    const info = @typeInfo(InvokeError).error_set.error_names orelse @compileError("expected concrete error_set");
     // Walk every runtime.Trap variant and confirm it is present in InvokeError.
     const required = [_][]const u8{
         "Unreachable",              "DivByZero",
@@ -993,8 +995,8 @@ test "zwasm facade T1.4-types: Instance.invoke return type carries all 12 Trap v
     };
     inline for (required) |name| {
         var found = false;
-        for (info) |e| {
-            if (std.mem.eql(u8, e.name, name)) {
+        for (info) |e_name| {
+            if (std.mem.eql(u8, e_name, name)) {
                 found = true;
                 break;
             }

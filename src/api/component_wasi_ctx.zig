@@ -21,15 +21,13 @@ const wasi_clocks = @import("../wasi/clocks.zig");
 const wasi_p1 = @import("../wasi/preview1.zig");
 const p2sock = @import("../wasi/p2_sockets.zig");
 const p3http = @import("../wasi/p3_http.zig");
+const p2http = @import("component_wasi_p2_http.zig");
 const resource_table = @import("../feature/component/resource_table.zig");
 const async_mod = @import("../feature/component/async.zig");
 const Caller = @import("../zwasm/caller.zig").Caller;
 
 const Allocator = std.mem.Allocator;
-const Engine = @import("../zwasm/engine.zig").Engine;
-const Module = @import("../zwasm/module.zig").Module;
 const Instance = @import("../zwasm/instance.zig").Instance;
-const Linker = @import("../zwasm/linker.zig").Linker;
 const Value = @import("../zwasm.zig").Value;
 const rt_value = @import("../runtime/value.zig");
 
@@ -53,6 +51,12 @@ const rt_value = @import("../runtime/value.zig");
 /// buffer the delivered bytes are copied into when the source becomes ready.
 pub const PendingRead = struct { ptr: u32, cap: u32, elem_size: u32 = 1 };
 pub const PendingWrite = struct { ptr: u32, count: u32, elem_size: u32 = 1 };
+/// The byte span of `count` stream elements of `elem_size` bytes, the length a
+/// copy hands to `Memory.sliceAt`. A span past u32 cannot lie in a 32-bit
+/// memory, so it is the trap `sliceAt` gives a span past the end.
+pub fn streamSpan(count: u32, elem_size: u32) Memory.Error!u32 {
+    return std.math.cast(u32, @as(u64, count) * elem_size) orelse error.OutOfBoundsLoad;
+}
 /// A socket read (accept / tcp-rx) that returned BLOCKED: the tcp socket rep
 /// plus the parked destination span, executed at readiness by
 /// `pollBlockedSockets` (the socket analogue of `PendingRead`).
@@ -76,6 +80,8 @@ pub const PendingClientSend = struct {
     req_rep: u32,
     retptr: u32,
     subtask: u32,
+    /// The network grant when `client.send` was called; the exchange runs later.
+    granted: bool,
     body: std.ArrayList(u8) = .empty,
     body_shared: ?u32 = null,
 };
@@ -107,8 +113,9 @@ pub const WasiP2Ctx = struct {
     /// adapter's `cabi_import_realloc`, which places each result in the
     /// buffer the preview1 caller supplied (e.g. `random_get`'s `buf`); the
     /// main module's `cabi_realloc` would put it somewhere else, and the
-    /// adapter asserts on that. Set while the component is built, from the
-    /// first lower that carries a realloc option.
+    /// adapter asserts on that. Set once every core instance is built; a
+    /// component whose lowers name two different reallocs is refused
+    /// (`UnsupportedLowerRealloc`).
     lower_realloc_instance: ?*Instance = null,
     lower_realloc_name: []const u8 = "",
     /// Instance whose linear memory the lowered funcs read/write — the
@@ -125,6 +132,8 @@ pub const WasiP2Ctx = struct {
     /// Live 0.2 file via-streams; a FILE_INPUT_STREAM_RT /
     /// FILE_OUTPUT_STREAM_RT handle's rep indexes this list.
     file_streams: std.ArrayList(FileStream) = .empty,
+    /// Live clock pollables; a CLOCK_POLLABLE_RT handle's rep indexes this list.
+    clock_deadlines: std.ArrayList(ClockDeadline) = .empty,
     /// Live tcp sockets (ADR-0180); a TCP_SOCKET_RT / SOCK_*_STREAM_RT /
     /// SOCK_POLLABLE_RT handle's rep (low bits) indexes this list.
     tcp_sockets: std.ArrayList(p2sock.TcpSocket) = .empty,
@@ -194,13 +203,15 @@ pub const WasiP2Ctx = struct {
     /// (receive → stream<u8>), `host_tcp_tx` (send's drained data stream).
     /// Values = the tcp socket list index (rep).
     udp_sockets: std.ArrayList(p2sock.UdpSocket) = .empty,
-    /// WASI-0.3 `wasi:http/types` `fields` resources (ADR-0205 phase D);
+    /// `wasi:http/types` `fields` resources (ADR-0205 phase D; both generations);
     /// a HTTP_FIELDS_RT handle's rep indexes this list. Dropped entries are
     /// deinit'ed in place (slot stays; reps are never reused).
     http_fields: std.ArrayList(p3http.HttpFields) = .empty,
     http_requests: std.ArrayList(p3http.HttpRequest) = .empty,
     http_responses: std.ArrayList(p3http.HttpResponse) = .empty,
     http_reqopts: std.ArrayList(p3http.HttpRequestOptions) = .empty,
+    /// The 0.2-only halves of the client exchange (bodies, futures).
+    http2: p2http.State = .{},
     /// Host-resolved trailers futures (keyed by READABLE handle): a guest
     /// read completes immediately with `ok(none)` — the shape a
     /// harness-built request's `consume-body` hands out (ADR-0205 D-3).
@@ -264,7 +275,7 @@ pub const WasiP2Ctx = struct {
     /// wasi:sockets (ADR-0180): a tcp-socket. Rep indexes `tcp_sockets`
     /// (NOT a P1 fd); its drop closes the OS socket via TcpSocket.deinit.
     pub const TCP_SOCKET_RT: u32 = 6;
-    /// The `wasi:sockets/network` singleton (ambient network; rep unused).
+    /// The `wasi:sockets/network` singleton (rep unused; the grant is `Host.allow_network`).
     pub const NETWORK_RT: u32 = 7;
     /// Socket-backed input/output-streams minted by finish-connect. Rep
     /// indexes `tcp_sockets`; dropping a stream does NOT close the socket
@@ -277,7 +288,7 @@ pub const WasiP2Ctx = struct {
     pub const SOCK_POLLABLE_RT: u32 = 10;
     /// WASI-0.3 `udp-socket` (rep = index into `udp_sockets`).
     pub const UDP_SOCKET3_RT: u32 = 11;
-    /// WASI-0.3 `wasi:http/types` `fields` (rep = index into `http_fields`;
+    /// `wasi:http/types` `fields` (rep = index into `http_fields`;
     /// drop frees the entry's pair storage — no OS handle).
     pub const HTTP_FIELDS_RT: u32 = 12;
     /// A BORROWED view onto a fields rep (minted by `request.get-headers` /
@@ -306,18 +317,39 @@ pub const WasiP2Ctx = struct {
     /// `fd_close` it.
     pub const FILE_INPUT_STREAM_RT: u32 = 20;
     pub const FILE_OUTPUT_STREAM_RT: u32 = 21;
+    /// The pollable `monotonic-clock.subscribe-instant` / `subscribe-duration`
+    /// mint. Rep indexes `clock_deadlines`.
+    pub const CLOCK_POLLABLE_RT: u32 = 22;
+    /// The `wasi:http@0.2` client resources (`component_wasi_p2_http.zig`).
+    /// Each rep indexes the matching `http2` table; the outgoing-request,
+    /// incoming-response, request-options and fields reuse the 0.3 ids.
+    pub const HTTP2_OUTGOING_BODY_RT: u32 = 23;
+    pub const HTTP2_FUTURE_RESPONSE_RT: u32 = 24;
+    pub const HTTP2_INCOMING_BODY_RT: u32 = 25;
+    pub const HTTP2_FUTURE_TRAILERS_RT: u32 = 26;
+    /// The memory-backed streams of a 0.2 request body (rep = its
+    /// outgoing-body) and response body (rep = its incoming-body).
+    pub const HTTP_BODY_OUT_RT: u32 = 27;
+    pub const HTTP_BODY_IN_RT: u32 = 28;
 
     /// Iteration state of one live directory-entry-stream: the directory's
     /// P1 fd + the P1 readdir cookie to resume after.
     pub const DirStream = struct { fd: wasi_p1.Fd, cookie: u64 };
 
     /// One live 0.2 file via-stream: the descriptor's P1 fd + the position
-    /// the next pread / pwrite uses.
-    pub const FileStream = struct { fd: wasi_p1.Fd, pos: u64 };
+    /// the next pread / pwrite uses. An `append` stream ignores `pos` and
+    /// writes at the file's end as of each write. A `dropped` entry is free
+    /// for the next mint.
+    pub const FileStream = struct { fd: wasi_p1.Fd, pos: u64, append: bool = false, dropped: bool = false };
+
+    /// One clock pollable: ready once the monotonic clock reaches
+    /// `deadline_ns`. A `dropped` entry is free for the next mint.
+    pub const ClockDeadline = struct { deadline_ns: u64, dropped: bool = false };
 
     /// A WASI-0.3 file via-stream peer: the P1 fd + the tracked byte position
-    /// the next pread/pwrite uses (advanced per completed copy).
-    pub const FileStreamRole = struct { fd: wasi_p1.Fd, pos: u64, result_future: u32 = 0 };
+    /// the next pread/pwrite uses (advanced per completed copy). An `append`
+    /// sink's copies write at the file's end as of each copy instead.
+    pub const FileStreamRole = struct { fd: wasi_p1.Fd, pos: u64, result_future: u32 = 0, append: bool = false };
 
     /// The substrate→P3 reverse-dep inversion (ADR-0207): the shared engine /
     /// drop / poll paths reach the 0.3 trampoline layer ONLY through these
@@ -370,6 +402,7 @@ pub const WasiP2Ctx = struct {
         self.http_requests.deinit(self.alloc);
         self.http_responses.deinit(self.alloc);
         self.http_reqopts.deinit(self.alloc);
+        self.http2.deinit(self.alloc);
         self.host_trailer_ok_futures.deinit(self.alloc);
         var body_it = self.host_body_bytes.iterator();
         while (body_it.next()) |e| self.alloc.free(e.value_ptr.data);
@@ -387,6 +420,7 @@ pub const WasiP2Ctx = struct {
         self.blocked_udp_receives.deinit(self.alloc);
         self.dir_streams.deinit(self.alloc);
         self.file_streams.deinit(self.alloc);
+        self.clock_deadlines.deinit(self.alloc);
         self.resources.deinit();
         self.guest_resources.deinit();
         for (self.rb_ctxs.items) |p| self.alloc.destroy(p);
@@ -423,6 +457,15 @@ pub const WasiP2Ctx = struct {
         const ptr: u32 = @bitCast(res[0].i32);
         if (ptr == 0 and size != 0) return WasiP2Error.ReallocFailed;
         return ptr;
+    }
+
+    /// `reallocGuest` for a list of `count` elements of `elem_size` bytes.
+    /// A byte size past u32 has nowhere to be written in a 32-bit memory, so
+    /// it is the store's trap (`OutOfBoundsStore`), not an allocator call.
+    pub fn reallocGuestArray(self: *WasiP2Ctx, count: usize, elem_size: u32, alignment: u32) WasiP2Error!u32 {
+        const size = std.math.mul(u64, count, elem_size) catch return error.OutOfBoundsStore;
+        if (size > std.math.maxInt(u32)) return error.OutOfBoundsStore;
+        return self.reallocGuest(@intCast(size), alignment);
     }
 
     /// The guest linear memory the lowered funcs operate on (`mem_instance`).
@@ -494,7 +537,7 @@ pub const WasiP2Ctx = struct {
                 end.setPendingEvent(.{ .code = .stream_read, .index = h, .payload = (async_mod.ReturnCode{ .completed = @intCast(filled) }).encode() });
             } else if (self.host_tcp_rx.get(end.shared) != null) {
                 const sock = self.tcpSocketRep(pr.rep) orelse continue;
-                const buf = try mem.sliceAt(pr.ptr, pr.cap * pr.elem_size);
+                const buf = try mem.sliceAt(pr.ptr, try streamSpan(pr.cap, pr.elem_size));
                 const n = sock.recv(io, buf) catch 0;
                 if (n == 0) {
                     // Ready-then-zero = peer FIN → the stream closes.
@@ -539,7 +582,7 @@ pub const WasiP2Ctx = struct {
             const end = self.streams.get(h) catch continue;
             try self.p3().udp_receive_complete(self, pr.rep, pr.retptr);
             end.subtask_state = .returned;
-            end.setPendingEvent(.{ .code = .subtask, .index = h, .payload = @intFromEnum(async_mod.SubtaskState.returned) });
+            end.setPendingEvent(.{ .code = .subtask, .index = h, .payload = @backingInt(async_mod.SubtaskState.returned) });
             _ = self.blocked_udp_receives.remove(h);
             progressed = true;
         }
@@ -563,7 +606,7 @@ pub const WasiP2Ctx = struct {
             if (self.host_sources.get(end.shared) == null) continue;
             const mem = try self.memory();
             // D-335: cap is in ELEMENTS; slice cap*elem_size bytes, COMPLETE in elements.
-            const buf = try mem.sliceAt(pr.ptr, pr.cap * pr.elem_size);
+            const buf = try mem.sliceAt(pr.ptr, try streamSpan(pr.cap, pr.elem_size));
             const n: u32 = @intCast(try readStdinP2(self.host, buf));
             end.state = .done;
             end.setPendingEvent(.{ .code = .stream_read, .index = m, .payload = (async_mod.ReturnCode{ .completed = @intCast(n / pr.elem_size) }).encode() });
@@ -597,6 +640,120 @@ pub fn ctxTcpSocket(ctx: *WasiP2Ctx, rep: u32) WasiP2Error!*p2sock.TcpSocket {
 
 pub fn ctxIo(ctx: *WasiP2Ctx) WasiP2Error!std.Io {
     return ctx.host.io orelse WasiP2Error.NoHostIo;
+}
+
+/// The network grant, checked by socket creation and by every sockets / HTTP
+/// op that reaches the host's network. `instance-network` stays ungated: its
+/// WIT result has no error arm.
+pub fn ctxRequireNetwork(ctx: *WasiP2Ctx) error{AccessDenied}!void {
+    if (!ctx.host.allow_network) return error.AccessDenied;
+}
+
+/// The `wasi:http` tables both generations index (a fields handle is the
+/// owned HTTP_FIELDS_RT or a borrowed HTTP_FIELDS_VIEW_RT).
+pub fn ctxHttpFields(ctx: *WasiP2Ctx, rep: u32) WasiP2Error!*p3http.HttpFields {
+    if (rep >= ctx.http_fields.items.len) return WasiP2Error.InvalidHandle;
+    return &ctx.http_fields.items[rep];
+}
+
+pub fn ctxHttpFieldsSelf(ctx: *WasiP2Ctx, self: u32) WasiP2Error!*p3http.HttpFields {
+    const rep = ctx.resources.rep(WasiP2Ctx.HTTP_FIELDS_RT, self) catch
+        try ctx.resources.rep(WasiP2Ctx.HTTP_FIELDS_VIEW_RT, self);
+    return ctxHttpFields(ctx, rep);
+}
+
+pub fn ctxMintHttpFields(ctx: *WasiP2Ctx, fields: p3http.HttpFields) WasiP2Error!u32 {
+    const idx: u32 = @intCast(ctx.http_fields.items.len);
+    ctx.http_fields.append(ctx.alloc, fields) catch return WasiP2Error.OutOfMemory;
+    return ctx.resources.new(WasiP2Ctx.HTTP_FIELDS_RT, idx);
+}
+
+pub fn ctxHttpRequest(ctx: *WasiP2Ctx, rep: u32) WasiP2Error!*p3http.HttpRequest {
+    if (rep >= ctx.http_requests.items.len) return WasiP2Error.InvalidHandle;
+    return &ctx.http_requests.items[rep];
+}
+
+/// A completed `httpExchange`. `headers_rep` indexes an immutable entry in
+/// `http_fields`; `body` is the caller's to own.
+pub const HttpExchange = struct { status: u16, headers_rep: u32, body: []u8 };
+
+/// The blocking HTTP exchange both `wasi:http` generations send through:
+/// `std.http.Client` over `http://` + the request's authority and path.
+/// `error.HttpFailed` is every failure the guest sees as `internal-error`;
+/// the network grant is the caller's to check.
+pub fn httpExchange(ctx: *WasiP2Ctx, req: *const p3http.HttpRequest, body: []u8) (WasiP2Error || error{HttpFailed})!HttpExchange {
+    const io = try ctxIo(ctx);
+    const authority = req.authority orelse return error.HttpFailed;
+    const path = req.path_with_query orelse "/";
+    const url = ctx.alloc.print("http://{s}{s}", .{ authority, path }) catch return WasiP2Error.OutOfMemory;
+    defer ctx.alloc.free(url);
+    const uri = std.Uri.parse(url) catch return error.HttpFailed;
+    const method: std.http.Method = switch (req.method) {
+        .get => .GET,
+        .head => .HEAD,
+        .post => .POST,
+        .put => .PUT,
+        .delete => .DELETE,
+        .connect => .CONNECT,
+        .options => .OPTIONS,
+        .trace => .TRACE,
+        .patch => .PATCH,
+        .other => return error.HttpFailed,
+    };
+    // content-length is computed by the std client from the body.
+    var extra: std.ArrayList(std.http.Header) = .empty;
+    defer extra.deinit(ctx.alloc);
+    if (req.headers_rep < ctx.http_fields.items.len) {
+        for (ctx.http_fields.items[req.headers_rep].entries.items) |p| {
+            if (std.ascii.eqlIgnoreCase(p.name, "content-length")) continue;
+            extra.append(ctx.alloc, .{ .name = p.name, .value = p.value }) catch return WasiP2Error.OutOfMemory;
+        }
+    }
+    // std writes a body only for POST / PUT / PATCH / QUERY (and asserts so);
+    // another method's body follows a bodiless head that states its length.
+    const raw_body = !method.requestHasBody() and body.len != 0;
+    const len_str = ctx.alloc.print("{d}", .{body.len}) catch return WasiP2Error.OutOfMemory;
+    defer ctx.alloc.free(len_str);
+    if (raw_body) extra.append(ctx.alloc, .{ .name = "content-length", .value = len_str }) catch return WasiP2Error.OutOfMemory;
+    var client: std.http.Client = .{ .allocator = ctx.alloc, .io = io };
+    defer client.deinit();
+    var hreq = client.request(method, uri, .{ .extra_headers = extra.items }) catch return error.HttpFailed;
+    defer hreq.deinit();
+    if (method.requestHasBody()) {
+        hreq.sendBodyComplete(body) catch return error.HttpFailed;
+    } else if (raw_body) {
+        hreq.sendBodilessUnflushed() catch return error.HttpFailed;
+        const conn = hreq.connection.?;
+        conn.writer().writeAll(body) catch return error.HttpFailed;
+        conn.flush() catch return error.HttpFailed;
+    } else {
+        hreq.sendBodiless() catch return error.HttpFailed;
+    }
+    var redirect_buf: [2048]u8 = undefined;
+    var hresp = hreq.receiveHead(&redirect_buf) catch return error.HttpFailed;
+
+    const fields_idx: u32 = @intCast(ctx.http_fields.items.len);
+    ctx.http_fields.append(ctx.alloc, .{}) catch return WasiP2Error.OutOfMemory;
+    var hit = hresp.head.iterateHeaders();
+    while (hit.next()) |hd| {
+        ctx.http_fields.items[fields_idx].appendChecked(ctx.alloc, hd.name, hd.value) catch continue;
+    }
+    ctx.http_fields.items[fields_idx].immutable = true;
+
+    var transfer_buf: [4096]u8 = undefined;
+    const rdr = hresp.reader(&transfer_buf);
+    var resp_body: std.ArrayList(u8) = .empty;
+    errdefer resp_body.deinit(ctx.alloc);
+    while (true) {
+        const chunk = rdr.peekGreedy(1) catch |e| switch (e) {
+            error.EndOfStream => break,
+            else => return error.HttpFailed,
+        };
+        resp_body.appendSlice(ctx.alloc, chunk) catch return WasiP2Error.OutOfMemory;
+        rdr.toss(chunk.len);
+    }
+    const owned = resp_body.toOwnedSlice(ctx.alloc) catch return WasiP2Error.OutOfMemory;
+    return .{ .status = @backingInt(hresp.head.status), .headers_rep = fields_idx, .body = owned };
 }
 
 /// `wasi_fd.readStdin` with its errors in this layer's set.
@@ -744,6 +901,39 @@ test "D-444 II: writeIpSocketAddressResult — CABI in-memory layout for both ad
     try std.testing.expectEqualSlices(u8, &b16, &back.ip6.bytes);
 }
 
+test "reallocGuestArray: the largest list byte size u32 holds reaches the allocator, one element more is the store's trap" {
+    const testing = std.testing;
+    var host = try wasi_host.Host.init(testing.allocator);
+    defer host.deinit();
+    var ctx = try WasiP2Ctx.init(testing.allocator, &host);
+    defer ctx.deinit();
+    // No guest allocator is bound, so a size that passes the check stops at it.
+    try testing.expectError(error.NoRealloc, ctx.reallocGuestArray(0x3FFF_FFFF, 4, 4));
+    try testing.expectError(error.OutOfBoundsStore, ctx.reallocGuestArray(0x4000_0000, 4, 4));
+    try testing.expectError(error.OutOfBoundsStore, ctx.reallocGuestArray(std.math.maxInt(usize), 18, 2));
+}
+
+test "a stream copy of more than 2^28-1 elements traps, and one at the limit packs its count" {
+    const testing = std.testing;
+    var host = try wasi_host.Host.init(testing.allocator);
+    defer host.deinit();
+    var ctx = try WasiP2Ctx.init(testing.allocator, &host);
+    defer ctx.deinit();
+    const pair = try async_mod.newStreamPair(&ctx.streams, &ctx.shared, null);
+    var abc: AsyncBuiltinCtx = .{ .ctx = &ctx, .type_index = 0 };
+    // A guest-to-guest rendezvous reads no memory.
+    var caller: Caller = .{ .rt = undefined, .host_data = &abc };
+    const max = async_mod.BUFFER_MAX_LENGTH;
+
+    try testing.expectError(error.BufferTooLong, p2StreamFutureCopy(&caller, pair.readable, 0, max + 1));
+    try testing.expectEqual(@as(u32, 0xffff_ffff), try p2StreamFutureCopy(&caller, pair.readable, 0, max));
+    try testing.expectError(error.BufferTooLong, p2StreamFutureCopy(&caller, pair.writable, 0, max + 1));
+    // The write meets the parked read; moving the elements is past this host.
+    try testing.expectError(error.UnsupportedAsyncBuiltin, p2StreamFutureCopy(&caller, pair.writable, 0, max));
+    const reader = try ctx.streams.get(pair.readable);
+    try testing.expectEqual((async_mod.ReturnCode{ .completed = max }).encode(), reader.pending_event.?.payload);
+}
+
 /// `tcp.local-address` (self, retptr) -> result<ip-socket-address, error-code>.
 pub const AsyncBuiltinCtx = struct { ctx: *WasiP2Ctx, type_index: u32, elem_size: u32 = 1 };
 
@@ -884,8 +1074,8 @@ pub fn p2WaitableJoin(caller: *Caller, waitable: u32, set_handle: u32) WasiP2Err
 pub fn mapGuestFault(e: anyerror) anyerror {
     if (e == error.OutOfMemory) return e;
     const TableError = resource_table.Error || async_mod.Error;
-    inline for (@typeInfo(TableError).error_set.?) |f| {
-        if (e == @field(TableError, f.name)) return error.Unreachable;
+    inline for (@typeInfo(TableError).error_set.error_names.?) |f_name| {
+        if (e == @field(TableError, f_name)) return error.Unreachable;
     }
     return e;
 }
@@ -893,7 +1083,7 @@ pub fn mapGuestFault(e: anyerror) anyerror {
 /// Packed return of an async-lowered import call (`CanonicalABI.md`
 /// `canon_lower`, async case): `state | (subtask_handle << 4)`; an eager
 /// completion returns bare `RETURNED` with no handle minted.
-pub const SUBTASK_RETURNED: u32 = @intFromEnum(async_mod.SubtaskState.returned);
+pub const SUBTASK_RETURNED: u32 = @backingInt(async_mod.SubtaskState.returned);
 
 /// `wasi:clocks/monotonic-clock@0.3.0` `wait-until: async func(when: mark)`
 /// under an async `canon lower` (ADR-0205 phase A). Already-elapsed deadline →
@@ -923,7 +1113,7 @@ fn p2WaitDeadlineAsync(ctx: *WasiP2Ctx, deadline_ns: u64) WasiP2Error!u32 {
         .subtask_state = .started,
         .deadline_ns = deadline_ns,
     });
-    return @intFromEnum(async_mod.SubtaskState.started) | (h << 4);
+    return @backingInt(async_mod.SubtaskState.started) | (h << 4);
 }
 
 /// The SYNC-lowered form of the async wait funcs (the Canonical ABI lets a
@@ -965,7 +1155,7 @@ pub fn p2WaitableSetPoll(caller: *Caller, set_handle: u32, ptr: u32) WasiP2Error
     const mem = try ctxMemory(caller);
     try mem.write(ptr, ev.index);
     try mem.write(ptr + 4, ev.payload);
-    return @intFromEnum(ev.code);
+    return @backingInt(ev.code);
 }
 
 /// `canon waitable-set.drop` — remove the set from the table (tearing down its
@@ -1048,6 +1238,7 @@ pub fn p2FutureCopy(caller: *Caller, handle: u32, ptr: u32) WasiP2Error!u32 {
 }
 
 pub fn p2StreamFutureCopy(caller: *Caller, handle: u32, ptr: u32, count: u32) WasiP2Error!u32 {
+    if (count > async_mod.BUFFER_MAX_LENGTH) return error.BufferTooLong;
     const r = try p2StreamFutureCopyInner(caller, handle, ptr, count);
     if (dbg.on("async.host")) std.debug.print("[host] copy -> 0x{x}\n", .{r});
     return r;
@@ -1099,13 +1290,15 @@ fn p2StreamFutureCopyInner(caller: *Caller, handle: u32, ptr: u32, count: u32) W
         // preads at u64::MAX and expects error-code::invalid).
         const pos_invalid = role.pos > std.math.maxInt(i64);
         if (end.side == .writable) {
-            const bytes = try mem.sliceAt(ptr, count * abc.elem_size);
-            const errno: wasi_p1.Errno = if (pos_invalid) .inval else wasi_fd.pwriteSlice(abc.ctx.host, role.fd, bytes, role.pos);
+            const bytes = try mem.sliceAt(ptr, try streamSpan(count, abc.elem_size));
+            const errno: wasi_p1.Errno = if (role.append)
+                wasi_fd.appendSlice(abc.ctx.host, role.fd, bytes)
+            else if (pos_invalid) .inval else wasi_fd.pwriteSlice(abc.ctx.host, role.fd, bytes, role.pos);
             if (errno != .success) return abc.ctx.p3().fail_file_stream(abc.ctx, end, role, errno);
             role.pos += bytes.len;
             return (async_mod.ReturnCode{ .completed = @intCast(count) }).encode();
         }
-        const buf = try mem.sliceAt(ptr, count * abc.elem_size);
+        const buf = try mem.sliceAt(ptr, try streamSpan(count, abc.elem_size));
         var n: usize = 0;
         const errno: wasi_p1.Errno = if (pos_invalid) .inval else wasi_fd.preadSlice(abc.ctx.host, role.fd, buf, role.pos, &n);
         if (errno != .success) return abc.ctx.p3().fail_file_stream(abc.ctx, end, role, errno);
@@ -1165,7 +1358,7 @@ fn p2StreamFutureCopyInner(caller: *Caller, handle: u32, ptr: u32, count: u32) W
             return (async_mod.ReturnCode{ .blocked = {} }).encode();
         }
         _ = abc.ctx.blocked_socket_reads.remove(handle);
-        const buf = try mem.sliceAt(ptr, count * abc.elem_size);
+        const buf = try mem.sliceAt(ptr, try streamSpan(count, abc.elem_size));
         const n = sock.recv(io, buf) catch 0;
         if (n == 0) {
             // Ready-then-zero = peer FIN → close the stream.
@@ -1192,7 +1385,7 @@ fn p2StreamFutureCopyInner(caller: *Caller, handle: u32, ptr: u32, count: u32) W
             end.state = .done;
             return (async_mod.ReturnCode{ .dropped = 0 }).encode();
         }
-        const n = @min(remaining, count * abc.elem_size);
+        const n = @min(remaining, try streamSpan(count, abc.elem_size));
         const buf = try mem.sliceAt(ptr, @intCast(n));
         @memcpy(buf, body.data[body.pos..][0..n]);
         body.pos += n;
@@ -1203,7 +1396,7 @@ fn p2StreamFutureCopyInner(caller: *Caller, handle: u32, ptr: u32, count: u32) W
     if (abc.ctx.host_capture_sinks.get(end.shared)) |cap| {
         if (end.side != .writable) return WasiP2Error.InvalidHandle;
         const mem = try abc.ctx.memory();
-        const bytes = try mem.sliceAt(ptr, count * abc.elem_size);
+        const bytes = try mem.sliceAt(ptr, try streamSpan(count, abc.elem_size));
         cap.appendSlice(abc.ctx.alloc, bytes) catch return WasiP2Error.OutOfMemory;
         return (async_mod.ReturnCode{ .completed = @intCast(count) }).encode();
     }
@@ -1213,7 +1406,7 @@ fn p2StreamFutureCopyInner(caller: *Caller, handle: u32, ptr: u32, count: u32) W
         if (end.side != .writable) return WasiP2Error.InvalidHandle;
         const mem = try abc.ctx.memory();
         const io = try ctxIo(abc.ctx);
-        const bytes = try mem.sliceAt(ptr, count * abc.elem_size);
+        const bytes = try mem.sliceAt(ptr, try streamSpan(count, abc.elem_size));
         const sock = try ctxTcpSocket(abc.ctx, role.rep);
         var off: usize = 0;
         while (off < bytes.len) {
@@ -1241,7 +1434,7 @@ fn p2StreamFutureCopyInner(caller: *Caller, handle: u32, ptr: u32, count: u32) W
         if (abc.ctx.host_sinks.get(end.shared)) |fd| {
             const mem = try abc.ctx.memory();
             // D-335: `count` is in ELEMENTS; the byte span is count * elem_size.
-            const bytes = try mem.sliceAt(ptr, count * abc.elem_size);
+            const bytes = try mem.sliceAt(ptr, try streamSpan(count, abc.elem_size));
             if (wasi_fd.writeSlice(abc.ctx.host, fd, bytes) != .success) return WasiP2Error.WriteFailed;
             return (async_mod.ReturnCode{ .completed = @intCast(count) }).encode();
         }
@@ -1262,7 +1455,7 @@ fn p2StreamFutureCopyInner(caller: *Caller, handle: u32, ptr: u32, count: u32) W
             const mem = try abc.ctx.memory();
             // D-335: `count` is in ELEMENTS; slice count*elem_size bytes, and
             // COMPLETE in elements (n bytes read / elem_size).
-            const buf = try mem.sliceAt(ptr, count * abc.elem_size);
+            const buf = try mem.sliceAt(ptr, try streamSpan(count, abc.elem_size));
             const n: u32 = @intCast(try readStdinP2(abc.ctx.host, buf));
             return (async_mod.ReturnCode{ .completed = @intCast(n / abc.elem_size) }).encode();
         }

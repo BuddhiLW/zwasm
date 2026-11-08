@@ -104,7 +104,7 @@ pub fn main(init: std.process.Init) !void {
         },
         .unknown => {
             var buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "zwasm: unknown subcommand '{s}' — run 'zwasm --help' for usage", .{subcmd_opt.?}) catch "zwasm: unknown subcommand";
+            const msg = std.mem.print(&buf, "zwasm: unknown subcommand '{s}' — run 'zwasm --help' for usage", .{subcmd_opt.?}) catch "zwasm: unknown subcommand";
             try printlnErr(io, msg);
             std.process.exit(2);
         },
@@ -135,6 +135,8 @@ pub fn main(init: std.process.Init) !void {
             defer env_vals.deinit(gpa);
             // ADR-0179 #3a-4 / D-314 — `--fuel` / `--timeout` / `--max-memory`.
             var limits: cli_run.Limits = .{};
+            // `--allow-network`: a component's sockets / HTTP may reach the host's network.
+            var allow_network = false;
             var cache_enabled = false;
             var cache_clear = false;
             var cache_dir_arg: ?[]const u8 = null;
@@ -210,6 +212,9 @@ pub fn main(init: std.process.Init) !void {
                         try env_vals.append(gpa, spec[spec.len..]);
                     }
                     next_arg = arg_it.next();
+                } else if (std.mem.eql(u8, a, "--allow-network")) {
+                    allow_network = true;
+                    next_arg = arg_it.next();
                 } else if (std.mem.eql(u8, a, "--fuel")) {
                     const v = optionValue(&arg_it) orelse {
                         try printlnErr(io, "usage: zwasm run --fuel <N> <path.wasm> [args...]");
@@ -270,13 +275,13 @@ pub fn main(init: std.process.Init) !void {
                     break;
                 } else if (isOption(a)) {
                     var buf: [256]u8 = undefined;
-                    const msg = std.fmt.bufPrint(&buf, "zwasm run: unknown option '{s}' — run 'zwasm --help' for usage", .{a}) catch "zwasm run: unknown option";
+                    const msg = std.mem.print(&buf, "zwasm run: unknown option '{s}' — run 'zwasm --help' for usage", .{a}) catch "zwasm run: unknown option";
                     try printlnErr(io, msg);
                     std.process.exit(2);
                 } else break;
             }
             const path_arg = next_arg orelse {
-                try printlnErr(io, "usage: zwasm run [--invoke <name>] [--engine <auto|interp|jit>] [--dir <host>[:<guest>]] [--env KEY=VAL] [--fuel <N>] [--timeout <ms>] [--max-memory <bytes>] [--max-table-elements <N>] [--cache[=DIR]] [--cache-clear] <path.wasm> [args...]");
+                try printlnErr(io, "usage: zwasm run [--invoke <name>] [--engine <auto|interp|jit>] [--dir <host>[:<guest>]] [--env KEY=VAL] [--allow-network] [--fuel <N>] [--timeout <ms>] [--max-memory <bytes>] [--max-table-elements <N>] [--cache[=DIR]] [--cache-clear] <path.wasm> [args...]");
                 std.process.exit(2);
             };
             const path = try gpa.dupe(u8, path_arg);
@@ -365,9 +370,16 @@ pub fn main(init: std.process.Init) !void {
                 }
                 // The guest's fd 0 (#257, #508): both hosts read the process
                 // stdin on demand, so nothing is read before the guest runs.
-                const code = cli_run.runComponentWasi(gpa, io, run_bytes, argv_list.items, preopen_list.items, env_keys.items, env_vals.items, .inherit) catch |err| {
+                var refusal: std.ArrayList(u8) = .empty;
+                defer refusal.deinit(gpa);
+                const invoke: ?cli_run.ComponentInvoke = if (invoke_name) |name| .{ .name = name, .args = invoke_args } else null;
+                const code = cli_run.runComponentWasi(gpa, io, run_bytes, path, invoke, argv_list.items, preopen_list.items, env_keys.items, env_vals.items, allow_network, .inherit, &refusal) catch |err| {
+                    if (err == error.ComponentRefused) {
+                        try printlnErr(io, refusal.items);
+                        std.process.exit(1);
+                    }
                     var buf: [256]u8 = undefined;
-                    const msg = std.fmt.bufPrint(&buf, "zwasm run: cannot run component '{s}': {s}", .{ path, @errorName(err) }) catch "zwasm run: component run failed";
+                    const msg = std.mem.print(&buf, "zwasm run: cannot run component '{s}': {s}", .{ path, @errorName(err) }) catch "zwasm run: component run failed";
                     try printlnErr(io, msg);
                     std.process.exit(1);
                 };
@@ -395,7 +407,7 @@ pub fn main(init: std.process.Init) !void {
                 // #233 / #530 — the diagnostic or the refusal is already on stderr.
                 if (err == error.InvalidModule or err == error.ArtifactTooLarge) std.process.exit(1);
                 var buf: [256]u8 = undefined;
-                const msg = std.fmt.bufPrint(&buf, "zwasm compile: {s}", .{@errorName(err)}) catch "zwasm compile: failed";
+                const msg = std.mem.print(&buf, "zwasm compile: {s}", .{@errorName(err)}) catch "zwasm compile: failed";
                 // EXEMPT-FALLBACK: ADR-0016 phase 1 — compile-error stderr report is last-resort; the process exits 1 regardless.
                 printlnErr(io, msg) catch {};
                 std.process.exit(1);
@@ -442,18 +454,18 @@ fn defaultCacheRoot(gpa: std.mem.Allocator, init: std.process.Init) ?[]const u8 
     switch (builtin.target.os.tag) {
         .windows => {
             const base = init.environ_map.get("LOCALAPPDATA") orelse return null;
-            return std.fmt.allocPrint(gpa, "{s}\\zwasm", .{base}) catch null;
+            return gpa.print("{s}\\zwasm", .{base}) catch null;
         },
         .macos => {
             const home = init.environ_map.get("HOME") orelse return null;
-            return std.fmt.allocPrint(gpa, "{s}/Library/Caches/zwasm", .{home}) catch null;
+            return gpa.print("{s}/Library/Caches/zwasm", .{home}) catch null;
         },
         else => {
             if (init.environ_map.get("XDG_CACHE_HOME")) |x| {
-                return std.fmt.allocPrint(gpa, "{s}/zwasm", .{x}) catch null;
+                return gpa.print("{s}/zwasm", .{x}) catch null;
             }
             const home = init.environ_map.get("HOME") orelse return null;
-            return std.fmt.allocPrint(gpa, "{s}/.cache/zwasm", .{home}) catch null;
+            return gpa.print("{s}/.cache/zwasm", .{home}) catch null;
         },
     }
 }
@@ -484,9 +496,9 @@ fn exitWithRunFailure(io: std.Io, err: anyerror, path: []const u8, bytes: []cons
 /// rather than `StreamTooLong` (#530).
 fn readFailureMsg(buf: []u8, path: []const u8, err: anyerror) []const u8 {
     return (if (err == error.StreamTooLong)
-        std.fmt.bufPrint(buf, "zwasm run: cannot read '{s}': larger than the {d} MiB cap", .{ path, cli_limits.max_file_bytes >> 20 })
+        std.mem.print(buf, "zwasm run: cannot read '{s}': larger than the {d} MiB cap", .{ path, cli_limits.max_file_bytes >> 20 })
     else
-        std.fmt.bufPrint(buf, "zwasm run: cannot read '{s}': {s}", .{ path, @errorName(err) })) catch "zwasm run: read failed";
+        std.mem.print(buf, "zwasm run: cannot read '{s}': {s}", .{ path, @errorName(err) })) catch "zwasm run: read failed";
 }
 
 fn printlnErr(io: std.Io, msg: []const u8) !void {

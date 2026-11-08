@@ -36,14 +36,13 @@ const Runtime = runtime.Runtime;
 const Value = runtime.Value;
 const Instance = runtime.Instance;
 
-const ObjectHeader = type_info_mod.ObjectHeader;
 const ObjectKind = type_info_mod.ObjectKind;
 const ArrayHeader = type_info_mod.ArrayHeader;
 const ArrayInfo = type_info_mod.ArrayInfo;
 const array_header_size: u32 = @sizeOf(ArrayHeader);
 
 inline fn op(o: ZirOp) usize {
-    return @intFromEnum(o);
+    return @backingInt(o);
 }
 
 pub fn register(table: *DispatchTable) void {

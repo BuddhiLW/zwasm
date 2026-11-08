@@ -92,7 +92,7 @@ Verification:
 ssh <windows-host> "echo ok && zig version"
 ```
 
-Expected output: `ok` + `0.16.0` (or whatever pinned Zig version
+Expected output: `ok` + `0.17.0` (or whatever pinned Zig version
 v2 uses).
 
 ## Bootstrap (one-time, per host)
@@ -182,7 +182,7 @@ zwasm v1.
   summary's `run test N pass, M skip` line is the count to compare against
   the other OSes; a rising skip count is a test that stopped running.
 - **`-Dtest-filter=<substring>` narrows every unit suite** (not only
-  `test-wasi-p3`), so a Windows-only assertion can be shown to execute:
+  `test-wasi-p2`), so a Windows-only assertion can be shown to execute:
   `zig build test -Dtest-filter=#262 --summary all` → `run test 4 pass`.
 - **The Win64 phase-end batch (`skip.phaseEnd(.win64)`) is 147 tests that
   never run on Windows anywhere** — the guard is an OS test, not a phase

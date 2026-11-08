@@ -1,6 +1,6 @@
 # zwasm v2
 
-A from-scratch WebAssembly runtime in Zig 0.16.0.
+A from-scratch WebAssembly runtime in Zig 0.17.0.
 
 > Pointers only — detailed plans live in [`.dev/ROADMAP.md`](../.dev/ROADMAP.md),
 > runnable procedures in [`.claude/skills/`](skills/). (The autonomous
@@ -21,7 +21,9 @@ zwasm v2 is a ground-up redesign of zwasm (v1 git history at commit 517cc5a).
   `main`, PR to `main`. `main` is **server-side ruleset-protected**: no direct
   push, PR required, and the `ci-required` status check (CI's 3-OS gate) must be
   green to merge; only the repo admin can bypass. Doc-only PRs auto-skip the
-  heavy gate (still green via `ci-required`). The local `scripts/gate_merge.sh`
+  heavy gate (still green via `ci-required`; the merge queue's run still gates
+  the merged tree, by running the gate or by proving it identical to a gated
+  one, ADR-0227). The local `scripts/gate_merge.sh`
   (3-host SSH fan-out) is an **optional** pre-PR pre-flight that runs
   `test-all` per host, not the CI leg — its header names what it leaves out
   (ADR-0076 D9) — CI's `ci-required` is authoritative. `--force`
@@ -33,9 +35,11 @@ zwasm v2 is a ground-up redesign of zwasm (v1 git history at commit 517cc5a).
   remain at root.
 - **Release stays user-only (ADR-0156)**: tag / publish / cutover are
   manual. The release line is the latest `v2.x` tag (see CHANGELOG /
-  GitHub Releases — do NOT hardcode it here, it rots). Cut = bump
-  `build.zig.zon` + CHANGELOG section + push the `vX.Y.Z` tag →
-  `release.yml` auto-builds + publishes. See
+  GitHub Releases — do NOT hardcode it here, it rots). Cut = dispatch
+  `release_prep` (folds `changelog.d/` into the CHANGELOG section + bumps
+  `build.zig.zon` on `release/vX.Y.Z`) → merge that PR through the queue →
+  push the `vX.Y.Z` tag → `release.yml` auto-builds + publishes. PRs add
+  entries as `changelog.d/` fragments, never to `CHANGELOG.md`. See
   [`.dev/archive/migration_v1_to_v2.md`](../.dev/archive/migration_v1_to_v2.md).
 - v1 ABI compatibility is out of scope; the C/Zig/CLI surfaces broke v1 on
   purpose (ADR-0156).
@@ -77,9 +81,11 @@ text or code identifiers.
   proceed without stopping (no user-flip). Default posture =
   autonomous-with-ADR; surface only for bucket-2/3 genuine blocks.
 - **CI gate is authoritative (post-v2.0.0 maintenance; ADR-0076 D9)**: `main`
-  is PR-only, and CI's `ci-required` runs `scripts/ci_gate.sh` on **all 3 OSes**
-  (aarch64-macos + x86_64-linux + aarch64-linux + x86_64-windows) for **every**
-  PR. That IS the
+  is PR-only, and CI's `ci-required` runs `scripts/ci_gate.sh` on **the 3 supported
+  OSes, as four legs** (aarch64-macos + x86_64-linux + aarch64-linux +
+  x86_64-windows) for **every** PR, and again on the merged tree in the merge
+  queue's `merge_group` run unless that tree is one the PR run gated
+  (ADR-0227). That IS the
   merge gate. A PR run gets the **core** gate — zig fmt + `test-all` +
   `bench-latency-build` (compile-only, ADR-0209) + the test-discovery guard,
   plus `run-rust-host` on the Linux legs only and the unit tests built
@@ -91,7 +97,10 @@ text or code identifiers.
   `spill_aware`) are gated on `ZWASM_CI_EXTENDED`, which `ci.yml` sets only on
   the **push to `main`** — they are up to ~20 cold-cache ReleaseSafe builds and
   would dominate every PR's wall-clock (rationale in `ci.yml`).
-  Doc-only PRs auto-skip the heavy legs (still green via `ci-required`). The
+  Doc-only PRs auto-skip the heavy legs (still green via `ci-required`) — the
+  PR's last push decides, and the `merge_group` run gates the merged tree
+  regardless, by running the gate or by proving it identical to a gated one
+  (`docs/development.md`). The
   local `scripts/gate_merge.sh` (3-host SSH fan-out) + `scripts/gate_commit.sh`
   (pre-commit) are now **optional pre-PR pre-flight** — a preview of part of
   the leg, not a reproduction of it (`gate_merge.sh`'s header names what it
@@ -178,7 +187,7 @@ text or code identifiers.
 feature / engine / interp / wasi / api / cli / diagnostic / support /
 platform — shape per ADR-0023 + ADR-0024).
 `include/` public C headers. `build.zig` build script. `flake.nix` Nix
-dev shell pinned to Zig 0.16.0.
+dev shell pinned to Zig 0.17.0.
 `.dev/` ROADMAP + debt + lessons + decisions + phase_log + setup
 docs (+ the frozen handover.md).
 `.claude/` settings, skills, rules, output styles.

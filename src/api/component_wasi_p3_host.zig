@@ -1,4 +1,4 @@
-// FILE-SIZE-EXEMPT: the complete wasi 0.3 host layer (fs3/sock3/http3 + async-lowered table + hook targets; ADR-0207 (c), M4-measured 2026-08-12); a per-proposal 3-way sub-split would force pub-leak of the hook targets through hooksTable/registerP3Arms (ADR-0099 N2), so cohesion wins while under the 2500 exempt cap.
+// FILE-SIZE-EXEMPT: (cap=2700) the complete wasi 0.3 host layer (fs3/sock3/http3 + async-lowered table + hook targets; ADR-0207 (c), M4-measured 2026-08-12); a per-proposal 3-way sub-split would force pub-leak of the hook targets through hooksTable/registerP3Arms, and a sibling test file would force pub-leak of the fs3 entry points its tests drive (ADR-0099 N2), so cohesion wins. 2026-10-24 +50 for the network grant's gate tests; 2026-10-25 +10 for the internal-error ordinal test (#643); 2026-10-25 +40 for the parked append-write test (#627). Splitting the sock3 / http3 host into its own file waits until after 2.8.0.
 //! WASI **0.3** (P3) host layer — fs3 / sock3 / http3 trampolines, the
 //! async-lowered binding table, and the classifier's P3 arm registration
 //! (ADR-0207 (c); file name reserved by ADR-0190). Depends ONLY on the
@@ -30,6 +30,11 @@ const FilestatResult = ctx_mod.FilestatResult;
 const PendingClientSend = ctx_mod.PendingClientSend;
 const ctxMemory = ctx_mod.ctxMemory;
 const ctxIo = ctx_mod.ctxIo;
+const ctxRequireNetwork = ctx_mod.ctxRequireNetwork;
+const ctxHttpFields = ctx_mod.ctxHttpFields;
+const ctxHttpFieldsSelf = ctx_mod.ctxHttpFieldsSelf;
+const ctxMintHttpFields = ctx_mod.ctxMintHttpFields;
+const ctxHttpRequest = ctx_mod.ctxHttpRequest;
 const ctxTcpSocket = ctx_mod.ctxTcpSocket;
 const ctxUdpSocket = ctx_mod.ctxUdpSocket;
 const descriptorFilestat = ctx_mod.descriptorFilestat;
@@ -532,23 +537,19 @@ fn fs3ReadViaStream(caller: *Caller, self_handle: u32, offset_raw: i64, retptr: 
 fn fs3WriteViaStream(caller: *Caller, self_handle: u32, data_handle: u32, offset_raw: i64) WasiP2Error!u32 {
     const ctx = caller.data(WasiP2Ctx);
     const fd = try fs3Fd(ctx, self_handle);
-    return fs3RegisterFileSink(ctx, fd, data_handle, @bitCast(offset_raw));
+    return fs3RegisterFileSink(ctx, .{ .fd = fd, .pos = @bitCast(offset_raw) }, data_handle);
 }
 
-/// `append-via-stream` (self, data) → future handle: the sink position starts
-/// at the current file size.
+/// `append-via-stream` (self, data) → future handle: each copy, including a
+/// write the guest parked before the sink existed, writes at the file's end
+/// as of that copy, so an append role never reads its `pos`.
 fn fs3AppendViaStream(caller: *Caller, self_handle: u32, data_handle: u32) WasiP2Error!u32 {
     const ctx = caller.data(WasiP2Ctx);
-    const mem = try ctxMemory(caller);
     const fd = try fs3Fd(ctx, self_handle);
-    const size: u64 = switch (try descriptorFilestat(ctx, mem, fd)) {
-        .ok => |fs| fs.size,
-        .err => 0,
-    };
-    return fs3RegisterFileSink(ctx, fd, data_handle, size);
+    return fs3RegisterFileSink(ctx, .{ .fd = fd, .pos = 0, .append = true }, data_handle);
 }
 
-fn fs3RegisterFileSink(ctx: *WasiP2Ctx, fd: wasi_p1.Fd, data_handle: u32, pos: u64) WasiP2Error!u32 {
+fn fs3RegisterFileSink(ctx: *WasiP2Ctx, sink: WasiP2Ctx.FileStreamRole, data_handle: u32) WasiP2Error!u32 {
     // Copy the shared id out BEFORE minting the future pair — the mint grows
     // the end table and invalidates `get`'s pointer.
     const shared_id = blk: {
@@ -557,7 +558,9 @@ fn fs3RegisterFileSink(ctx: *WasiP2Ctx, fd: wasi_p1.Fd, data_handle: u32, pos: u
         break :blk end.shared;
     };
     const fut = try async_mod.newFuturePair(&ctx.streams, &ctx.shared, null);
-    try ctx.host_file_streams.put(ctx.alloc, shared_id, .{ .fd = fd, .pos = pos, .result_future = fut.readable });
+    var role = sink;
+    role.result_future = fut.readable;
+    try ctx.host_file_streams.put(ctx.alloc, shared_id, role);
     try ctx.host_result_futures.put(ctx.alloc, fut.readable, null);
     try fs3DrainParkedWrite(ctx, shared_id);
     return fut.readable;
@@ -576,8 +579,11 @@ fn fs3DrainParkedWrite(ctx: *WasiP2Ctx, shared_id: u32) WasiP2Error!void {
     const pw = ctx.pending_writes.get(pending.waitable) orelse return;
     const role = ctx.host_file_streams.getPtr(shared_id) orelse return;
     const mem = try ctx.memory();
-    const bytes = try mem.sliceAt(pw.ptr, pw.count * pw.elem_size);
-    const errno = wasi_fd.pwriteSlice(ctx.host, role.fd, bytes, role.pos);
+    const bytes = try mem.sliceAt(pw.ptr, try ctx_mod.streamSpan(pw.count, pw.elem_size));
+    const errno = if (role.append)
+        wasi_fd.appendSlice(ctx.host, role.fd, bytes)
+    else
+        wasi_fd.pwriteSlice(ctx.host, role.fd, bytes, role.pos);
     const writer = try ctx.streams.get(pending.waitable);
     if (errno != .success) {
         _ = try fs3FailFileStream(ctx, writer, role, errno);
@@ -744,7 +750,7 @@ fn fs3DirStreamRead(ctx: *WasiP2Ctx, state_index: u32, end: *async_mod.StreamFut
             @memcpy(dest, src);
         }
         const rec = ptr + filled * 24;
-        const p1_ft: wasi_p1.Filetype = @enumFromInt(d_type);
+        const p1_ft: wasi_p1.Filetype = @fromBackingInt(@intCast(d_type));
         try writeFs3DescriptorType(mem, rec, p1_ft);
         try mem.write(rec + 16, name_ptr);
         try mem.write(rec + 20, d_namlen);
@@ -862,9 +868,10 @@ fn sock3IsAnyAddr(addr: std.Io.net.IpAddress) bool {
 fn sock3TcpCreate(caller: *Caller, family: u32, retptr: u32) WasiP2Error!void {
     const ctx = caller.data(WasiP2Ctx);
     const mem = try ctxMemory(caller);
+    ctxRequireNetwork(ctx) catch |e| return writeSock3Err(mem, retptr, 4, e);
     if (family > 1) return writeSock3Err(mem, retptr, 4, error.InvalidArgument);
     const idx: u32 = @intCast(ctx.tcp_sockets.items.len);
-    ctx.tcp_sockets.append(ctx.alloc, p2sock.TcpSocket.create(@enumFromInt(family))) catch return WasiP2Error.OutOfMemory;
+    ctx.tcp_sockets.append(ctx.alloc, p2sock.TcpSocket.create(@fromBackingInt(@intCast(family)))) catch return WasiP2Error.OutOfMemory;
     const handle = try ctx.resources.new(WasiP2Ctx.TCP_SOCKET_RT, idx);
     try mem.write(retptr, @as(u8, 0));
     try mem.write(retptr + 4, handle);
@@ -880,6 +887,7 @@ fn sock3TcpBind(caller: *Caller, self: u32, disc: u32, p0: u32, p1: u32, p2: u32
     const ctx = caller.data(WasiP2Ctx);
     const mem = try ctxMemory(caller);
     const sock = try sock3TcpSelf(ctx, self);
+    ctxRequireNetwork(ctx) catch |e| return writeSock3UnitResult(mem, retptr, e);
     const addr = decodeIpSocketAddress(disc, .{ p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10 }) orelse
         return writeSock3UnitResult(mem, retptr, error.InvalidArgument);
     if (sock3IsMulticastOrBroadcast(addr) or sock3IsV4MappedV6(addr))
@@ -909,6 +917,10 @@ fn sock3TcpConnect(caller: *Caller, argsptr: u32, retptr: u32) WasiP2Error!u32 {
         return SUBTASK_RETURNED;
     }
     const sock = try sock3TcpSelf(ctx, self);
+    ctxRequireNetwork(ctx) catch |e| {
+        try writeSock3UnitResult(mem, retptr, e);
+        return SUBTASK_RETURNED;
+    };
     const io = try ctxIo(ctx);
     // Explicitly bound (the 0.3 `bind` → `connect` transition) takes the
     // raw bound-connect composition; everything else the std connect.
@@ -950,7 +962,7 @@ fn readSock3AddrVariant(mem: Memory, base: u32) WasiP2Error!?std.Io.net.IpAddres
             const flow = try mem.read(u32, pay + 4);
             var bytes: [16]u8 = undefined;
             for (0..8) |i| {
-                const seg = try mem.read(u16, pay + 8 + @as(u32, @intCast(i * 2)));
+                const seg = try mem.readElem(u16, pay + 8, @intCast(i));
                 bytes[i * 2] = @intCast(seg >> 8);
                 bytes[i * 2 + 1] = @truncate(seg);
             }
@@ -968,6 +980,7 @@ fn sock3TcpListen(caller: *Caller, self: u32, retptr: u32) WasiP2Error!void {
     const rep = try ctx.resources.rep(WasiP2Ctx.TCP_SOCKET_RT, self);
     {
         const sock = try ctxTcpSocket(ctx, rep);
+        ctxRequireNetwork(ctx) catch |e| return writeSock3Err(mem, retptr, 4, e);
         const io = try ctxIo(ctx);
         sock.listenNow(io) catch |e| return writeSock3Err(mem, retptr, 4, e);
     }
@@ -1060,7 +1073,7 @@ fn sock3DrainParkedTcpWrite(ctx: *WasiP2Ctx, shared_id: u32) WasiP2Error!void {
     const pw = ctx.pending_writes.get(pending.waitable) orelse return;
     const role = ctx.host_tcp_tx.get(shared_id) orelse return;
     const mem = try ctx.memory();
-    const bytes = try mem.sliceAt(pw.ptr, pw.count * pw.elem_size);
+    const bytes = try mem.sliceAt(pw.ptr, try ctx_mod.streamSpan(pw.count, pw.elem_size));
     const sock = try ctxTcpSocket(ctx, role.rep);
     const io = try ctxIo(ctx);
     var off: usize = 0;
@@ -1136,7 +1149,7 @@ fn sock3TcpIsListening(caller: *Caller, self: u32) WasiP2Error!u32 {
 fn sock3TcpFamily(caller: *Caller, self: u32) WasiP2Error!u32 {
     const ctx = caller.data(WasiP2Ctx);
     const sock = try sock3TcpSelf(ctx, self);
-    return @intFromEnum(sock.family);
+    return @backingInt(sock.family);
 }
 
 fn sock3TcpSetBacklog(caller: *Caller, self: u32, value: u64, retptr: u32) WasiP2Error!void {
@@ -1274,9 +1287,10 @@ fn sock3TcpSndbufSet(caller: *Caller, self: u32, value_raw: i64, retptr: u32) Wa
 fn sock3UdpCreate(caller: *Caller, family: u32, retptr: u32) WasiP2Error!void {
     const ctx = caller.data(WasiP2Ctx);
     const mem = try ctxMemory(caller);
+    ctxRequireNetwork(ctx) catch |e| return writeSock3Err(mem, retptr, 4, e);
     if (family > 1) return writeSock3Err(mem, retptr, 4, error.InvalidArgument);
     const idx: u32 = @intCast(ctx.udp_sockets.items.len);
-    ctx.udp_sockets.append(ctx.alloc, p2sock.UdpSocket.create(@enumFromInt(family))) catch return WasiP2Error.OutOfMemory;
+    ctx.udp_sockets.append(ctx.alloc, p2sock.UdpSocket.create(@fromBackingInt(@intCast(family)))) catch return WasiP2Error.OutOfMemory;
     const handle = try ctx.resources.new(WasiP2Ctx.UDP_SOCKET3_RT, idx);
     try mem.write(retptr, @as(u8, 0));
     try mem.write(retptr + 4, handle);
@@ -1290,6 +1304,7 @@ fn sock3UdpBind(caller: *Caller, self: u32, disc: u32, p0: u32, p1: u32, p2: u32
     const ctx = caller.data(WasiP2Ctx);
     const mem = try ctxMemory(caller);
     const sock = try sock3UdpSelf(ctx, self);
+    ctxRequireNetwork(ctx) catch |e| return writeSock3UnitResult(mem, retptr, e);
     const addr = decodeIpSocketAddress(disc, .{ p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10 }) orelse
         return writeSock3UnitResult(mem, retptr, error.InvalidArgument);
     if (sock3IsMulticastOrBroadcast(addr) or sock3IsV4MappedV6(addr))
@@ -1302,6 +1317,7 @@ fn sock3UdpConnect(caller: *Caller, self: u32, disc: u32, p0: u32, p1: u32, p2: 
     const ctx = caller.data(WasiP2Ctx);
     const mem = try ctxMemory(caller);
     const sock = try sock3UdpSelf(ctx, self);
+    ctxRequireNetwork(ctx) catch |e| return writeSock3UnitResult(mem, retptr, e);
     const addr = decodeIpSocketAddress(disc, .{ p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10 }) orelse
         return writeSock3UnitResult(mem, retptr, error.InvalidArgument);
     if (sock3IsMulticastOrBroadcast(addr) or sock3IsAnyAddr(addr) or sock3IsV4MappedV6(addr) or switch (addr) {
@@ -1344,6 +1360,10 @@ fn sock3UdpSend(caller: *Caller, argsptr: u32, retptr: u32) WasiP2Error!u32 {
     const data_len = try mem.read(u32, argsptr + 8);
     const has_remote = (try mem.read(u8, argsptr + 12)) != 0;
     const sock = try sock3UdpSelf(ctx, self);
+    ctxRequireNetwork(ctx) catch |e| {
+        try writeSock3UnitResult(mem, retptr, e);
+        return SUBTASK_RETURNED;
+    };
     const dest: std.Io.net.IpAddress = blk: {
         if (has_remote) {
             const a = (try readSock3AddrVariant(mem, argsptr + 16)) orelse {
@@ -1416,7 +1436,7 @@ fn sock3UdpReceive(caller: *Caller, self: u32, retptr: u32) WasiP2Error!u32 {
         .subtask_state = .started,
     });
     try ctx.blocked_udp_receives.put(ctx.alloc, h, .{ .rep = rep, .retptr = retptr });
-    return @intFromEnum(async_mod.SubtaskState.started) | (h << 4);
+    return @backingInt(async_mod.SubtaskState.started) | (h << 4);
 }
 
 /// The receive proper: recvfrom into a fresh guest buffer + marshal the
@@ -1445,7 +1465,7 @@ fn sock3UdpReceiveComplete(ctx: *WasiP2Ctx, rep: u32, retptr: u32) WasiP2Error!v
             try mem.write(retptr + 20, a.flow);
             for (0..8) |i| {
                 const seg: u16 = (@as(u16, a.bytes[i * 2]) << 8) | a.bytes[i * 2 + 1];
-                try mem.write(retptr + 24 + @as(u32, @intCast(i * 2)), seg);
+                try mem.writeElem(retptr + 24, @intCast(i), seg);
             }
             try mem.write(retptr + 40, @as(u32, 0)); // scope-id
         },
@@ -1461,23 +1481,6 @@ fn sock3UdpReceiveComplete(ctx: *WasiP2Ctx, rep: u32, retptr: u32) WasiP2Error!v
 // (name_ptr, name_len, val_ptr, val_len) 16 B; `result<_, header-error>` =
 // disc u8@0, err variant disc u8@4, `other`'s option<string> none u8@8.
 
-fn ctxHttpFields(ctx: *WasiP2Ctx, rep: u32) WasiP2Error!*p3http.HttpFields {
-    if (rep >= ctx.http_fields.items.len) return WasiP2Error.InvalidHandle;
-    return &ctx.http_fields.items[rep];
-}
-
-fn http3FieldsSelf(ctx: *WasiP2Ctx, self: u32) WasiP2Error!*p3http.HttpFields {
-    const rep = ctx.resources.rep(WasiP2Ctx.HTTP_FIELDS_RT, self) catch
-        try ctx.resources.rep(WasiP2Ctx.HTTP_FIELDS_VIEW_RT, self);
-    return ctxHttpFields(ctx, rep);
-}
-
-fn http3MintFields(ctx: *WasiP2Ctx, fields: p3http.HttpFields) WasiP2Error!u32 {
-    const idx: u32 = @intCast(ctx.http_fields.items.len);
-    ctx.http_fields.append(ctx.alloc, fields) catch return WasiP2Error.OutOfMemory;
-    return ctx.resources.new(WasiP2Ctx.HTTP_FIELDS_RT, idx);
-}
-
 /// `result<_, header-error>` (ok = null).
 fn writeHeaderErrResult(mem: Memory, retptr: u32, e: ?p3http.FieldsError) WasiP2Error!void {
     if (e) |err| {
@@ -1491,7 +1494,7 @@ fn writeHeaderErrResult(mem: Memory, retptr: u32, e: ?p3http.FieldsError) WasiP2
 
 fn http3FieldsNew(caller: *Caller) WasiP2Error!u32 {
     const ctx = caller.data(WasiP2Ctx);
-    return http3MintFields(ctx, .{});
+    return ctxMintHttpFields(ctx, .{});
 }
 
 fn http3FieldsFromList(caller: *Caller, entries_ptr: u32, entries_len: u32, retptr: u32) WasiP2Error!void {
@@ -1512,7 +1515,7 @@ fn http3FieldsFromList(caller: *Caller, entries_ptr: u32, entries_len: u32, retp
             return;
         };
     }
-    const handle = try http3MintFields(ctx, fields);
+    const handle = try ctxMintHttpFields(ctx, fields);
     try mem.write(retptr, @as(u8, 0));
     try mem.write(retptr + 4, handle);
 }
@@ -1535,7 +1538,7 @@ fn http3AllocBlob(ctx: *WasiP2Ctx, mem: Memory, bytes: []const u8) WasiP2Error!u
 /// Marshal `list<field-value>`: the elem table is one allocation, each
 /// value another (see `http3AllocBlob`); (ptr,len) lands at `retptr`.
 fn http3WriteValueList(ctx: *WasiP2Ctx, mem: Memory, retptr: u32, values: []const []const u8) WasiP2Error!void {
-    const base = if (values.len == 0) 4 else try ctx.reallocGuest(@intCast(values.len * 8), 4);
+    const base = if (values.len == 0) 4 else try ctx.reallocGuestArray(values.len, 8, 4);
     for (values, 0..) |v, i| {
         const p = try http3AllocBlob(ctx, mem, v);
         const rec = base + @as(u32, @intCast(i * 8));
@@ -1549,7 +1552,7 @@ fn http3WriteValueList(ctx: *WasiP2Ctx, mem: Memory, retptr: u32, values: []cons
 fn http3FieldsGet(caller: *Caller, self: u32, name_ptr: u32, name_len: u32, retptr: u32) WasiP2Error!void {
     const ctx = caller.data(WasiP2Ctx);
     const mem = try ctxMemory(caller);
-    const fields = try http3FieldsSelf(ctx, self);
+    const fields = try ctxHttpFieldsSelf(ctx, self);
     const name = try mem.sliceAt(name_ptr, name_len);
     var values: std.ArrayList([]const u8) = .empty;
     defer values.deinit(ctx.alloc);
@@ -1560,7 +1563,7 @@ fn http3FieldsGet(caller: *Caller, self: u32, name_ptr: u32, name_len: u32, retp
 fn http3FieldsHas(caller: *Caller, self: u32, name_ptr: u32, name_len: u32) WasiP2Error!u32 {
     const ctx = caller.data(WasiP2Ctx);
     const mem = try ctxMemory(caller);
-    const fields = try http3FieldsSelf(ctx, self);
+    const fields = try ctxHttpFieldsSelf(ctx, self);
     const name = try mem.sliceAt(name_ptr, name_len);
     return @intFromBool(fields.has(name));
 }
@@ -1568,7 +1571,7 @@ fn http3FieldsHas(caller: *Caller, self: u32, name_ptr: u32, name_len: u32) Wasi
 fn http3FieldsSet(caller: *Caller, self: u32, name_ptr: u32, name_len: u32, values_ptr: u32, values_len: u32, retptr: u32) WasiP2Error!void {
     const ctx = caller.data(WasiP2Ctx);
     const mem = try ctxMemory(caller);
-    const fields = try http3FieldsSelf(ctx, self);
+    const fields = try ctxHttpFieldsSelf(ctx, self);
     const name = try mem.sliceAt(name_ptr, name_len);
     var values: std.ArrayList([]const u8) = .empty;
     defer values.deinit(ctx.alloc);
@@ -1585,7 +1588,7 @@ fn http3FieldsSet(caller: *Caller, self: u32, name_ptr: u32, name_len: u32, valu
 fn http3FieldsDelete(caller: *Caller, self: u32, name_ptr: u32, name_len: u32, retptr: u32) WasiP2Error!void {
     const ctx = caller.data(WasiP2Ctx);
     const mem = try ctxMemory(caller);
-    const fields = try http3FieldsSelf(ctx, self);
+    const fields = try ctxHttpFieldsSelf(ctx, self);
     const name = try mem.sliceAt(name_ptr, name_len);
     fields.delete(ctx.alloc, name) catch |e| return writeHeaderErrResult(mem, retptr, e);
     try writeHeaderErrResult(mem, retptr, null);
@@ -1594,7 +1597,7 @@ fn http3FieldsDelete(caller: *Caller, self: u32, name_ptr: u32, name_len: u32, r
 fn http3FieldsGetAndDelete(caller: *Caller, self: u32, name_ptr: u32, name_len: u32, retptr: u32) WasiP2Error!void {
     const ctx = caller.data(WasiP2Ctx);
     const mem = try ctxMemory(caller);
-    const fields = try http3FieldsSelf(ctx, self);
+    const fields = try ctxHttpFieldsSelf(ctx, self);
     const name = try mem.sliceAt(name_ptr, name_len);
     var out: std.ArrayList([]u8) = .empty;
     defer {
@@ -1613,7 +1616,7 @@ fn http3FieldsGetAndDelete(caller: *Caller, self: u32, name_ptr: u32, name_len: 
 fn http3FieldsAppend(caller: *Caller, self: u32, name_ptr: u32, name_len: u32, value_ptr: u32, value_len: u32, retptr: u32) WasiP2Error!void {
     const ctx = caller.data(WasiP2Ctx);
     const mem = try ctxMemory(caller);
-    const fields = try http3FieldsSelf(ctx, self);
+    const fields = try ctxHttpFieldsSelf(ctx, self);
     const name = try mem.sliceAt(name_ptr, name_len);
     const value = try mem.sliceAt(value_ptr, value_len);
     fields.append(ctx.alloc, name, value) catch |e| return writeHeaderErrResult(mem, retptr, e);
@@ -1623,11 +1626,11 @@ fn http3FieldsAppend(caller: *Caller, self: u32, name_ptr: u32, name_len: u32, v
 fn http3FieldsCopyAll(caller: *Caller, self: u32, retptr: u32) WasiP2Error!void {
     const ctx = caller.data(WasiP2Ctx);
     const mem = try ctxMemory(caller);
-    const fields = try http3FieldsSelf(ctx, self);
+    const fields = try ctxHttpFieldsSelf(ctx, self);
     // Elem table = one allocation; each name string and value list its own
     // (per-element buffer ownership — see http3AllocBlob).
     const items = fields.entries.items;
-    const base = if (items.len == 0) 4 else try ctx.reallocGuest(@intCast(items.len * 16), 4);
+    const base = if (items.len == 0) 4 else try ctx.reallocGuestArray(items.len, 16, 4);
     for (items, 0..) |p, i| {
         const np = try http3AllocBlob(ctx, mem, p.name);
         const vp = try http3AllocBlob(ctx, mem, p.value);
@@ -1643,13 +1646,13 @@ fn http3FieldsCopyAll(caller: *Caller, self: u32, retptr: u32) WasiP2Error!void 
 
 fn http3FieldsClone(caller: *Caller, self: u32) WasiP2Error!u32 {
     const ctx = caller.data(WasiP2Ctx);
-    const src = try http3FieldsSelf(ctx, self);
+    const src = try ctxHttpFieldsSelf(ctx, self);
     var copy: p3http.HttpFields = .{};
     src.cloneInto(ctx.alloc, &copy) catch {
         copy.deinit(ctx.alloc);
         return WasiP2Error.OutOfMemory;
     };
-    return http3MintFields(ctx, copy);
+    return ctxMintHttpFields(ctx, copy);
 }
 
 // -- request / response / request-options (ADR-0205 phase D-2) --
@@ -1726,7 +1729,7 @@ fn http3RequestGetMethod(caller: *Caller, self: u32, retptr: u32) WasiP2Error!vo
             try mem.write(retptr + 4, p);
             try mem.write(retptr + 8, @as(u32, @intCast(s.len)));
         },
-        else => try mem.write(retptr, @as(u8, @intFromEnum(std.meta.activeTag(req.method)))),
+        else => try mem.write(retptr, @as(u8, @backingInt(std.meta.activeTag(req.method)))),
     }
 }
 
@@ -2078,7 +2081,7 @@ fn http3ClientSend(caller: *Caller, request: u32, retptr: u32) WasiP2Error!u32 {
         .subtask_state = .started,
     });
     const pcs = ctx.alloc.create(PendingClientSend) catch return WasiP2Error.OutOfMemory;
-    pcs.* = .{ .req_rep = rep, .retptr = retptr, .subtask = h };
+    pcs.* = .{ .req_rep = rep, .retptr = retptr, .subtask = h, .granted = if (ctxRequireNetwork(ctx)) |_| true else |_| false };
     ctx.pending_client_sends.append(ctx.alloc, pcs) catch {
         ctx.alloc.destroy(pcs);
         return WasiP2Error.OutOfMemory;
@@ -2095,12 +2098,7 @@ fn http3ClientSend(caller: *Caller, request: u32, retptr: u32) WasiP2Error!u32 {
     // so the transferred-end release must be explicit.
     http3DropTransferredEnd(ctx, req.trailers_future);
     req.trailers_future = 0;
-    return @intFromEnum(async_mod.SubtaskState.started) | (h << 4);
-}
-
-fn ctxHttpRequest(ctx: *WasiP2Ctx, rep: u32) WasiP2Error!*p3http.HttpRequest {
-    if (rep >= ctx.http_requests.items.len) return WasiP2Error.InvalidHandle;
-    return &ctx.http_requests.items[rep];
+    return @backingInt(async_mod.SubtaskState.started) | (h << 4);
 }
 
 /// Resolve parked `client.send`s whose request body is complete (the body
@@ -2134,96 +2132,48 @@ pub fn pollPendingClientSends(self: *WasiP2Ctx) WasiP2Error!bool {
     return progressed;
 }
 
-/// The blocking HTTP exchange for one resolved `client.send`: std.http
-/// Client against the request's scheme/authority/path, the response minted
-/// as a host-built resource (`host_body_bytes`-served body; trailers via
-/// the resolved-ok(none) future at consume-body). result<own<response>,
-/// error-code> marshals at retptr with payload offset 8 (error-code
-/// carries u64 cases).
+/// Marshal one resolved `client.send` (`ctx_mod.httpExchange` performs it):
+/// the response minted as a host-built resource (`host_body_bytes`-served
+/// body; trailers via the resolved-ok(none) future at consume-body).
+/// result<own<response>, error-code> marshals at retptr with payload offset
+/// 8 (error-code carries u64 cases).
 fn http3PerformSend(self: *WasiP2Ctx, pcs: *PendingClientSend) WasiP2Error!void {
     const mem = try self.memory();
-    const io = try ctxIo(self);
     const req = try ctxHttpRequest(self, pcs.req_rep);
     const fail = struct {
         fn write(m: Memory, retptr: u32, sub: *async_mod.StreamFutureEnd, h: u32) WasiP2Error!void {
+            // error-code `internal-error(option<string>)` = ordinal 38, none.
+            return code(m, retptr, sub, h, 38);
+        }
+        fn code(m: Memory, retptr: u32, sub: *async_mod.StreamFutureEnd, h: u32, ordinal: u8) WasiP2Error!void {
             try m.write(retptr, @as(u8, 1));
-            // error-code `internal-error(option<string>)` = ordinal 37, none.
-            try m.write(retptr + 8, @as(u8, 37));
+            try m.write(retptr + 8, ordinal);
             try m.write(retptr + 16, @as(u8, 0));
             sub.subtask_state = .returned;
-            sub.setPendingEvent(.{ .code = .subtask, .index = h, .payload = @intFromEnum(async_mod.SubtaskState.returned) });
+            sub.setPendingEvent(.{ .code = .subtask, .index = h, .payload = @backingInt(async_mod.SubtaskState.returned) });
         }
     };
     const sub = try self.streams.get(pcs.subtask);
-    const authority = req.authority orelse return fail.write(mem, pcs.retptr, sub, pcs.subtask);
-    const path = req.path_with_query orelse "/";
-    const url = std.fmt.allocPrint(self.alloc, "http://{s}{s}", .{ authority, path }) catch return WasiP2Error.OutOfMemory;
-    defer self.alloc.free(url);
-    const uri = std.Uri.parse(url) catch return fail.write(mem, pcs.retptr, sub, pcs.subtask);
-    const method: std.http.Method = switch (req.method) {
-        .get => .GET,
-        .head => .HEAD,
-        .post => .POST,
-        .put => .PUT,
-        .delete => .DELETE,
-        .connect => .CONNECT,
-        .options => .OPTIONS,
-        .trace => .TRACE,
-        .patch => .PATCH,
-        .other => return fail.write(mem, pcs.retptr, sub, pcs.subtask),
+    // Denied here rather than at `client.send`, so the parked body stream
+    // drains and releases as on any failed exchange. `HTTP-request-denied` = 15.
+    if (!pcs.granted) return fail.code(mem, pcs.retptr, sub, pcs.subtask, 15);
+    const ex = ctx_mod.httpExchange(self, req, pcs.body.items) catch |e| switch (e) {
+        error.HttpFailed => return fail.write(mem, pcs.retptr, sub, pcs.subtask),
+        else => |oe| return oe,
     };
-    // Request headers from the fields model; content-length is computed by
-    // the std client from the body.
-    var extra: std.ArrayList(std.http.Header) = .empty;
-    defer extra.deinit(self.alloc);
-    if (req.headers_rep < self.http_fields.items.len) {
-        for (self.http_fields.items[req.headers_rep].entries.items) |p| {
-            if (std.ascii.eqlIgnoreCase(p.name, "content-length")) continue;
-            extra.append(self.alloc, .{ .name = p.name, .value = p.value }) catch return WasiP2Error.OutOfMemory;
-        }
-    }
-    var client: std.http.Client = .{ .allocator = self.alloc, .io = io };
-    defer client.deinit();
-    var hreq = client.request(method, uri, .{ .extra_headers = extra.items }) catch return fail.write(mem, pcs.retptr, sub, pcs.subtask);
-    defer hreq.deinit();
-    hreq.sendBodyComplete(pcs.body.items) catch return fail.write(mem, pcs.retptr, sub, pcs.subtask);
-    var redirect_buf: [2048]u8 = undefined;
-    var hresp = hreq.receiveHead(&redirect_buf) catch return fail.write(mem, pcs.retptr, sub, pcs.subtask);
-
-    // Response headers → an immutable fields entry.
-    const fields_idx: u32 = @intCast(self.http_fields.items.len);
-    self.http_fields.append(self.alloc, .{}) catch return WasiP2Error.OutOfMemory;
-    var hit = hresp.head.iterateHeaders();
-    while (hit.next()) |hd| {
-        self.http_fields.items[fields_idx].appendChecked(self.alloc, hd.name, hd.value) catch continue;
-    }
-    self.http_fields.items[fields_idx].immutable = true;
-
-    // Response body → a host-served stream.
-    var transfer_buf: [4096]u8 = undefined;
-    const rdr = hresp.reader(&transfer_buf);
-    var body: std.ArrayList(u8) = .empty;
-    defer body.deinit(self.alloc);
-    while (true) {
-        const chunk = rdr.peekGreedy(1) catch |e| switch (e) {
-            error.EndOfStream => break,
-            else => return fail.write(mem, pcs.retptr, sub, pcs.subtask),
-        };
-        body.appendSlice(self.alloc, chunk) catch return WasiP2Error.OutOfMemory;
-        rdr.toss(chunk.len);
-    }
     var contents: ?u32 = null;
-    if (body.items.len > 0) {
+    if (ex.body.len > 0) {
+        // Block-scoped: disarmed once `put` has handed the bytes to the map.
+        errdefer self.alloc.free(ex.body);
         const pair = try async_mod.newStreamPair(&self.streams, &self.shared, null);
         const shared_id = (try self.streams.get(pair.readable)).shared;
-        const copy = self.alloc.dupe(u8, body.items) catch return WasiP2Error.OutOfMemory;
-        try self.host_body_bytes.put(self.alloc, shared_id, .{ .data = copy });
+        try self.host_body_bytes.put(self.alloc, shared_id, .{ .data = ex.body });
         contents = pair.readable;
-    }
+    } else self.alloc.free(ex.body);
     const resp_idx: u32 = @intCast(self.http_responses.items.len);
     self.http_responses.append(self.alloc, .{
-        .status = @intFromEnum(hresp.head.status),
-        .headers_rep = fields_idx,
+        .status = ex.status,
+        .headers_rep = ex.headers_rep,
         .contents_stream = contents,
     }) catch return WasiP2Error.OutOfMemory;
     const handle = try self.resources.new(WasiP2Ctx.HTTP_RESPONSE_RT, resp_idx);
@@ -2233,7 +2183,7 @@ fn http3PerformSend(self: *WasiP2Ctx, pcs: *PendingClientSend) WasiP2Error!void 
     // streams table, dangling the `sub` pointer taken at entry.
     const sub2 = try self.streams.get(pcs.subtask);
     sub2.subtask_state = .returned;
-    sub2.setPendingEvent(.{ .code = .subtask, .index = pcs.subtask, .payload = @intFromEnum(async_mod.SubtaskState.returned) });
+    sub2.setPendingEvent(.{ .code = .subtask, .index = pcs.subtask, .payload = @backingInt(async_mod.SubtaskState.returned) });
 }
 
 /// Register a harness capture sink for `shared_id`, draining a write that
@@ -2249,7 +2199,7 @@ pub fn http3RegisterCaptureSink(ctx: *WasiP2Ctx, shared_id: u32, cap: *std.Array
     if (pending.side != .writable) return;
     const pw = ctx.pending_writes.get(pending.waitable) orelse return;
     const mem = try ctx.memory();
-    const bytes = try mem.sliceAt(pw.ptr, pw.count * pw.elem_size);
+    const bytes = try mem.sliceAt(pw.ptr, try ctx_mod.streamSpan(pw.count, pw.elem_size));
     cap.appendSlice(ctx.alloc, bytes) catch return WasiP2Error.OutOfMemory;
     const writer = try ctx.streams.get(pending.waitable);
     writer.state = .idle;
@@ -2292,7 +2242,7 @@ fn sock3UdpRemoteAddress(caller: *Caller, self: u32, retptr: u32) WasiP2Error!vo
 fn sock3UdpFamily(caller: *Caller, self: u32) WasiP2Error!u32 {
     const ctx = caller.data(WasiP2Ctx);
     const sock = try sock3UdpSelf(ctx, self);
-    return @intFromEnum(sock.family);
+    return @backingInt(sock.family);
 }
 
 fn sock3UdpHopGet(caller: *Caller, self: u32, retptr: u32) WasiP2Error!void {
@@ -2347,10 +2297,14 @@ fn sock3ResolveAddresses(caller: *Caller, name_ptr: u32, name_len: u32, retptr: 
     const mem = try ctxMemory(caller);
     const name = try mem.sliceAt(name_ptr, name_len);
     var addrs: [32]std.Io.net.IpAddress = undefined;
-    const n = p2sock.resolveAddresses(try ctxIo(ctx), name, &addrs) catch |e| {
+    const n = blk: {
+        ctxRequireNetwork(ctx) catch |e| break :blk e;
+        break :blk p2sock.resolveAddresses(try ctxIo(ctx), name, &addrs);
+    } catch |e| {
         // ip-name-lookup has its OWN error-code variant (ordinals per its
         // WIT declaration order; `other(option<string>)` = 5, none).
         const code: u8 = switch (e) {
+            error.AccessDenied => 0,
             error.InvalidName => 1,
             error.NameUnresolvable => 2,
             error.TemporaryResolverFailure => 3,
@@ -2364,7 +2318,7 @@ fn sock3ResolveAddresses(caller: *Caller, name_ptr: u32, name_len: u32, retptr: 
     };
     // ok: list<ip-address>; ip-address variant = disc u8@0, payload@2
     // (ipv4 4×u8 / ipv6 8×u16-le) → elem size 18 align 2.
-    const base = try ctx.reallocGuest(@intCast(n * 18), 2);
+    const base = try ctx.reallocGuestArray(n, 18, 2);
     for (addrs[0..n], 0..) |a, i| {
         const elem_ptr = base + @as(u32, @intCast(i * 18));
         switch (a) {
@@ -2376,7 +2330,7 @@ fn sock3ResolveAddresses(caller: *Caller, name_ptr: u32, name_len: u32, retptr: 
                 try mem.write(elem_ptr, @as(u8, 1));
                 for (0..8) |j| {
                     const seg: u16 = (@as(u16, v.bytes[j * 2]) << 8) | v.bytes[j * 2 + 1];
-                    try mem.write(elem_ptr + 2 + @as(u32, @intCast(j * 2)), seg);
+                    try mem.writeElem(elem_ptr + 2, @intCast(j), seg);
                 }
             },
         }
@@ -2481,7 +2435,194 @@ pub fn registerP3Arms(lk: *Linker, module: []const u8, name: []const u8, op: ada
         .fs3_stat, .fs3_stat_at, .fs3_get_type, .fs3_get_flags, .fs3_set_times, .fs3_set_times_at, .fs3_set_size, .fs3_advise, .fs3_sync, .fs3_sync_data, .fs3_open_at, .fs3_create_directory_at, .fs3_remove_directory_at, .fs3_unlink_file_at, .fs3_readlink_at, .fs3_rename_at, .fs3_symlink_at, .fs3_link_at, .fs3_is_same_object, .fs3_metadata_hash, .fs3_metadata_hash_at => return error.UnsupportedWasiImport,
         // Every non-P3 op belongs to the facade classifier; listing the
         // tags (not `else`) keeps this switch compile-time exhaustive too.
-        .cli_get_stdout, .cli_get_stderr, .cli_get_stdin, .cli_stdout_write_via_stream, .cli_stderr_write_via_stream, .cli_stdin_read_via_stream, .out_stream_write, .out_stream_blocking_write_and_flush, .out_stream_blocking_flush, .out_stream_drop, .in_stream_read, .in_stream_blocking_read, .in_stream_drop, .cli_exit, .cli_exit_with_code, .clocks_wall_now, .clocks_monotonic_now, .clocks_system_now, .clocks_system_get_resolution, .clocks_monotonic_get_resolution, .clocks_wall_resolution, .clocks_wait_until, .clocks_wait_for, .random_get_bytes, .fs_descriptor_read, .fs_descriptor_write, .fs_descriptor_open_at, .fs_descriptor_sync, .fs_descriptor_stat, .fs_descriptor_get_type, .fs_descriptor_drop, .fs_get_directories, .poll_pollable_ready, .poll_pollable_block, .poll_poll, .in_stream_subscribe, .out_stream_subscribe, .clocks_subscribe_instant, .clocks_subscribe_duration, .cli_get_environment, .cli_get_arguments, .cli_initial_cwd, .cli_get_terminal_stdin, .cli_get_terminal_stdout, .cli_get_terminal_stderr, .out_stream_check_write, .random_get_u64, .random_insecure_get_bytes, .random_insecure_get_u64, .random_insecure_seed, .fs_descriptor_stat_at, .fs_descriptor_create_directory_at, .fs_descriptor_link_at, .fs_descriptor_readlink_at, .fs_descriptor_remove_directory_at, .fs_descriptor_rename_at, .fs_descriptor_symlink_at, .fs_descriptor_sync_data, .fs_descriptor_unlink_file_at, .fs_descriptor_read_directory, .fs_dir_entry_stream_read, .fs_dir_entry_stream_drop, .io_resource_drop, .fs_read_via_stream, .fs_write_via_stream, .fs_append_via_stream, .fs_stub_get_flags, .fs_filesystem_error_code, .fs_descriptor_metadata_hash, .fs_descriptor_metadata_hash_at, .sock_instance_network, .sock_create_tcp, .sock_tcp_start_bind, .sock_tcp_finish_bind, .sock_tcp_start_connect, .sock_tcp_finish_connect, .sock_tcp_subscribe, .sock_tcp_shutdown, .sock_tcp_is_listening, .sock_tcp_drop, .sock_tcp_start_listen, .sock_tcp_finish_listen, .sock_tcp_accept, .sock_tcp_local_address, .sock_tcp_remote_address, .sock_tcp_set_backlog, .sock_stub_unit2, .sock_stub_unit3i, .sock_stub_unit3l, .sock_stub_unit15, .sock_stub_val1, .sock_stub_val4, .sock_stub_val8, .sock_stub_val15_4, .sock_stub_resolve, .sock_stub_recv, .sock_stub_send, .sock_stub_subscribe => return false,
+        .cli_get_stdout, .cli_get_stderr, .cli_get_stdin, .cli_stdout_write_via_stream, .cli_stderr_write_via_stream, .cli_stdin_read_via_stream, .out_stream_write, .out_stream_blocking_write_and_flush, .out_stream_blocking_flush, .out_stream_drop, .in_stream_read, .in_stream_blocking_read, .in_stream_drop, .cli_exit, .cli_exit_with_code, .clocks_wall_now, .clocks_monotonic_now, .clocks_system_now, .clocks_system_get_resolution, .clocks_monotonic_get_resolution, .clocks_wall_resolution, .clocks_wait_until, .clocks_wait_for, .random_get_bytes, .fs_descriptor_read, .fs_descriptor_write, .fs_descriptor_open_at, .fs_descriptor_sync, .fs_descriptor_stat, .fs_descriptor_get_type, .fs_descriptor_drop, .fs_get_directories, .poll_pollable_ready, .poll_pollable_block, .poll_poll, .in_stream_subscribe, .out_stream_subscribe, .clocks_subscribe_instant, .clocks_subscribe_duration, .cli_get_environment, .cli_get_arguments, .cli_initial_cwd, .cli_get_terminal_stdin, .cli_get_terminal_stdout, .cli_get_terminal_stderr, .out_stream_check_write, .random_get_u64, .random_insecure_get_bytes, .random_insecure_get_u64, .random_insecure_seed, .fs_descriptor_stat_at, .fs_descriptor_create_directory_at, .fs_descriptor_link_at, .fs_descriptor_readlink_at, .fs_descriptor_remove_directory_at, .fs_descriptor_rename_at, .fs_descriptor_symlink_at, .fs_descriptor_sync_data, .fs_descriptor_unlink_file_at, .fs_descriptor_read_directory, .fs_dir_entry_stream_read, .fs_dir_entry_stream_drop, .io_resource_drop, .fs_read_via_stream, .fs_write_via_stream, .fs_append_via_stream, .fs_stub_get_flags, .fs_filesystem_error_code, .fs_descriptor_metadata_hash, .fs_descriptor_metadata_hash_at, .sock_instance_network, .sock_create_tcp, .sock_tcp_start_bind, .sock_tcp_finish_bind, .sock_tcp_start_connect, .sock_tcp_finish_connect, .sock_tcp_subscribe, .sock_tcp_shutdown, .sock_tcp_is_listening, .sock_tcp_drop, .sock_tcp_start_listen, .sock_tcp_finish_listen, .sock_tcp_accept, .sock_tcp_local_address, .sock_tcp_remote_address, .sock_tcp_set_backlog, .sock_stub_unit2, .sock_stub_unit3i, .sock_stub_unit3l, .sock_stub_unit15, .sock_stub_val1, .sock_stub_val4, .sock_stub_val8, .sock_stub_val15_4, .sock_stub_resolve, .sock_stub_recv, .sock_stub_send, .sock_stub_subscribe, .http2_fields_from_list, .http2_fields_set, .http2_fields_delete, .http2_fields_append, .http2_outgoing_request_new, .http2_outgoing_request_body, .http2_reqopts_connect_set, .http2_reqopts_first_byte_set, .http2_reqopts_between_bytes_set, .http2_outgoing_body_write, .http2_outgoing_body_finish, .http2_handle, .http2_future_subscribe, .http2_future_response_get, .http2_incoming_response_consume, .http2_incoming_body_stream, .http2_incoming_body_finish, .http2_future_trailers_get, .http2_http_error_code => return false,
     }
     return true;
+}
+
+test "0.3 append-via-stream: two append sinks on one file each write at the end the other left" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "log.txt", .data = "abc" });
+    var host = try wasi_host.Host.init(testing.allocator);
+    defer host.deinit();
+    host.io = io;
+    const dirfd = try host.addPreopen(tmp.dir.handle, "/w");
+    var ctx = try WasiP2Ctx.init(testing.allocator, &host);
+    defer ctx.deinit();
+
+    // A module exporting one page of memory and a bump cabi_realloc stands in
+    // for the guest's.
+    var eng = try Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var mod = try eng.compile("\x00asm\x01\x00\x00\x00\x01\x09\x01\x60\x04\x7f\x7f\x7f\x7f\x01\x7f\x03\x02\x01\x00\x05\x03\x01\x00\x01\x06\x07\x01\x7f\x01\x41\x80\x08\x0b\x07\x19\x02\x06memory\x02\x00\x0ccabi_realloc\x00\x00\x0a\x0d\x01\x0b\x00\x23\x00\x23\x00\x20\x03j\x24\x00\x0b");
+    defer mod.deinit();
+    var lk = eng.linker();
+    defer lk.deinit();
+    var inst = try lk.instantiate(&mod, .{});
+    defer inst.deinit();
+    ctx.mem_instance = &inst;
+    ctx.realloc_instance = &inst;
+    const bytes = (try ctx.memory()).slice();
+
+    @memcpy(bytes[0..7], "log.txt");
+    try testing.expectEqual(wasi_p1.Errno.success, wasi_fd.pathOpen(&host, bytes, dirfd, 0, 0, 7, 0, wasi_p1.RIGHTS_FD_WRITE | wasi_p1.RIGHTS_FD_SEEK | wasi_p1.RIGHTS_FD_FILESTAT_GET, 0, 0, 8));
+    const desc = try ctx.resources.new(WasiP2Ctx.DESCRIPTOR_RT, std.mem.readInt(u32, bytes[8..12], .little));
+    var caller: Caller = .{ .rt = inst.handle.runtime.?, .host_data = &ctx };
+    // Both sinks register while the file holds "abc".
+    var guest_ends: [2]u32 = undefined;
+    for (&guest_ends) |*w| {
+        const pair = try async_mod.newStreamPair(&ctx.streams, &ctx.shared, null);
+        _ = try fs3AppendViaStream(&caller, desc, pair.readable);
+        w.* = pair.writable;
+    }
+
+    var abc: ctx_mod.AsyncBuiltinCtx = .{ .ctx = &ctx, .type_index = 0 };
+    var copy_caller: Caller = .{ .rt = inst.handle.runtime.?, .host_data = &abc };
+    @memcpy(bytes[16..18], "XY");
+    _ = try ctx_mod.p2StreamFutureCopy(&copy_caller, guest_ends[0], 16, 1);
+    _ = try ctx_mod.p2StreamFutureCopy(&copy_caller, guest_ends[1], 17, 1);
+    const got = try tmp.dir.readFileAlloc(io, "log.txt", testing.allocator, .limited(16));
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("abcXY", got);
+}
+
+test "0.3 append-via-stream: a write parked before the sink registers lands at the file's end" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "log.txt", .data = "abc" });
+    var host = try wasi_host.Host.init(testing.allocator);
+    defer host.deinit();
+    host.io = io;
+    const dirfd = try host.addPreopen(tmp.dir.handle, "/w");
+    var ctx = try WasiP2Ctx.init(testing.allocator, &host);
+    defer ctx.deinit();
+
+    var eng = try Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var mod = try eng.compile("\x00asm\x01\x00\x00\x00\x01\x09\x01\x60\x04\x7f\x7f\x7f\x7f\x01\x7f\x03\x02\x01\x00\x05\x03\x01\x00\x01\x06\x07\x01\x7f\x01\x41\x80\x08\x0b\x07\x19\x02\x06memory\x02\x00\x0ccabi_realloc\x00\x00\x0a\x0d\x01\x0b\x00\x23\x00\x23\x00\x20\x03j\x24\x00\x0b");
+    defer mod.deinit();
+    var lk = eng.linker();
+    defer lk.deinit();
+    var inst = try lk.instantiate(&mod, .{});
+    defer inst.deinit();
+    ctx.mem_instance = &inst;
+    ctx.realloc_instance = &inst;
+    const bytes = (try ctx.memory()).slice();
+
+    @memcpy(bytes[0..7], "log.txt");
+    try testing.expectEqual(wasi_p1.Errno.success, wasi_fd.pathOpen(&host, bytes, dirfd, 0, 0, 7, 0, wasi_p1.RIGHTS_FD_WRITE | wasi_p1.RIGHTS_FD_SEEK | wasi_p1.RIGHTS_FD_FILESTAT_GET, 0, 0, 8));
+    const desc = try ctx.resources.new(WasiP2Ctx.DESCRIPTOR_RT, std.mem.readInt(u32, bytes[8..12], .little));
+    const pair = try async_mod.newStreamPair(&ctx.streams, &ctx.shared, null);
+
+    var abc: ctx_mod.AsyncBuiltinCtx = .{ .ctx = &ctx, .type_index = 0 };
+    var copy_caller: Caller = .{ .rt = inst.handle.runtime.?, .host_data = &abc };
+    bytes[16] = 'X';
+    try testing.expectEqual((async_mod.ReturnCode{ .blocked = {} }).encode(), try ctx_mod.p2StreamFutureCopy(&copy_caller, pair.writable, 16, 1));
+    var caller: Caller = .{ .rt = inst.handle.runtime.?, .host_data = &ctx };
+    _ = try fs3AppendViaStream(&caller, desc, pair.readable);
+    const got = try tmp.dir.readFileAlloc(io, "log.txt", testing.allocator, .limited(16));
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("abcX", got);
+}
+
+test "without the network grant, each 0.3 op that reaches the network answers access-denied" {
+    const testing = std.testing;
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var host = try wasi_host.Host.init(testing.allocator);
+    defer host.deinit();
+    host.io = threaded.io();
+    var ctx = try WasiP2Ctx.init(testing.allocator, &host);
+    defer ctx.deinit();
+    var eng = try Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var mod = try eng.compile("\x00asm\x01\x00\x00\x00\x05\x03\x01\x00\x01\x07\x0a\x01\x06memory\x02\x00");
+    defer mod.deinit();
+    var lk = eng.linker();
+    defer lk.deinit();
+    var inst = try lk.instantiate(&mod, .{});
+    defer inst.deinit();
+    ctx.mem_instance = &inst;
+    const mem = try ctx.memory();
+    var caller: Caller = .{ .rt = inst.handle.runtime.?, .host_data = &ctx };
+
+    try sock3TcpCreate(&caller, 0, 32);
+    try sock3UdpCreate(&caller, 0, 48);
+    // The sockets the other ops need are created under a grant, then it is revoked.
+    host.allow_network = true;
+    try sock3TcpCreate(&caller, 0, 0);
+    const tcp = try mem.read(u32, 4);
+    try sock3UdpCreate(&caller, 0, 0);
+    const udp = try mem.read(u32, 4);
+    host.allow_network = false;
+    // 127.0.0.1:9 flat (p0 = port, p1..p4 = octets); one 16-byte result slot per op.
+    try sock3TcpBind(&caller, tcp, 0, 9, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 64);
+    try sock3TcpListen(&caller, tcp, 80);
+    try sock3UdpBind(&caller, udp, 0, 9, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 96);
+    try sock3UdpConnect(&caller, udp, 0, 9, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 112);
+    // Spilled connect args: self@0, ip-socket-address variant@4 (port@8, octets@10).
+    try mem.write(@as(u32, 512), tcp);
+    try mem.write(@as(u32, 520), @as(u16, 9));
+    for ([_]u8{ 127, 0, 0, 1 }, 0..) |b, i| try mem.write(@as(u32, @intCast(522 + i)), b);
+    _ = try sock3TcpConnect(&caller, 512, 128);
+    // Spilled send args: self@0, data ptr@4, len@8, no remote@12.
+    try mem.write(@as(u32, 576), udp);
+    _ = try sock3UdpSend(&caller, 576, 144);
+    @memcpy(mem.slice()[640..649], "localhost");
+    _ = try sock3ResolveAddresses(&caller, 640, 9, 160);
+    var r: u32 = 32;
+    while (r <= 160) : (r += 16) {
+        try testing.expectEqual(@as(u8, 1), try mem.read(u8, r));
+        try testing.expectEqual(@as(u8, 0), try mem.read(u8, r + 4)); // access-denied
+    }
+    // A request sent without the grant stays denied when the grant arrives
+    // before its exchange runs.
+    try ctx.http_requests.append(testing.allocator, .{ .headers_rep = 0 });
+    _ = try http3ClientSend(&caller, try ctx.resources.new(WasiP2Ctx.HTTP_REQUEST_RT, 0), 192);
+    host.allow_network = true;
+    _ = try pollPendingClientSends(&ctx);
+    try testing.expectEqual(@as(u8, 1), try mem.read(u8, 192));
+    try testing.expectEqual(@as(u8, 15), try mem.read(u8, 200)); // HTTP-request-denied
+
+    try sock3TcpBind(&caller, tcp, 0, 0, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 64);
+    try testing.expectEqual(@as(u8, 0), try mem.read(u8, 64));
+}
+
+test "an outbound HTTP exchange that fails answers internal-error, not configuration-error" {
+    const testing = std.testing;
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var host = try wasi_host.Host.init(testing.allocator);
+    defer host.deinit();
+    host.io = threaded.io();
+    host.allow_network = true;
+    var ctx = try WasiP2Ctx.init(testing.allocator, &host);
+    defer ctx.deinit();
+    var eng = try Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var mod = try eng.compile("\x00asm\x01\x00\x00\x00\x05\x03\x01\x00\x01\x07\x0a\x01\x06memory\x02\x00");
+    defer mod.deinit();
+    var lk = eng.linker();
+    defer lk.deinit();
+    var inst = try lk.instantiate(&mod, .{});
+    defer inst.deinit();
+    ctx.mem_instance = &inst;
+    var caller: Caller = .{ .rt = inst.handle.runtime.?, .host_data = &ctx };
+
+    // No authority, so the exchange fails before it reaches the network.
+    try ctx.http_requests.append(testing.allocator, .{ .headers_rep = 0 });
+    _ = try http3ClientSend(&caller, try ctx.resources.new(WasiP2Ctx.HTTP_REQUEST_RT, 0), 0);
+    _ = try pollPendingClientSends(&ctx);
+    const mem = try ctx.memory();
+    try testing.expectEqual(@as(u8, 1), try mem.read(u8, 0));
+    try testing.expectEqual(@as(u8, 38), try mem.read(u8, 8));
 }

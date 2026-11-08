@@ -60,7 +60,6 @@ pub const TraceCallback = trap_mod.TraceCallback;
 pub const Frame = frame_mod.Frame;
 pub const Label = frame_mod.Label;
 pub const max_operand_stack = frame_mod.max_operand_stack;
-pub const max_frame_stack = frame_mod.max_frame_stack;
 pub const frame_chunk_len = frame_mod.frame_chunk_len;
 pub const default_max_frame_depth = frame_mod.default_max_frame_depth;
 pub const max_label_stack = frame_mod.max_label_stack;
@@ -340,7 +339,7 @@ pub const Runtime = struct {
     /// previous shape (returnCallOp → mvp.invoke → dispatch.run
     /// recursion) mirrored Wasm tail-call depth onto the host
     /// call stack and tripped `Trap.CallStackExhausted` at
-    /// `max_frame_stack = 256` for self-recursive count(N≥256).
+    /// the then-fixed 256-frame cap for self-recursive count(N≥256).
     pending_tail_call: ?*const zir.ZirFunc = null,
 
     /// 10.G-foundation cycle 5 (ADR-0115 §1 zero-overhead gate).
@@ -367,7 +366,7 @@ pub const Runtime = struct {
     /// touch them) and freed at `deinit`.
     frame_chunks: std.ArrayList(*[frame_chunk_len]Frame) = .empty,
     /// Call-depth cap: pushing frame number `max_frame_depth + 1` traps
-    /// `CallStackExhausted`. An embedder may raise or lower it per runtime.
+    /// `CallStackExhausted`. Set per `Runtime`.
     max_frame_depth: u32 = default_max_frame_depth,
 
     /// D-288 / ADR-0167: explicit override of the native-stack low limit
@@ -624,27 +623,46 @@ pub const Runtime = struct {
         return &self.frame_chunks.items[rest / frame_chunk_len][rest % frame_chunk_len];
     }
 
-    pub fn pushFrame(self: *Runtime, frame: Frame) Trap!void {
+    /// `inline`, and the header written field by field: a by-value `Frame`
+    /// (~2.6 KiB, mostly `label_buf`, undefined at push) would otherwise be
+    /// built on every caller's native stack, roughly halving the call depth
+    /// the interp reaches before the native-stack check binds. A frame is
+    /// pushed with no labels; push them on `currentFrame()` afterwards.
+    pub inline fn pushFrame(self: *Runtime, frame: Frame) Trap!void {
+        std.debug.assert(frame.label_len == 0);
         if (self.frame_len >= self.max_frame_depth) return Trap.CallStackExhausted;
-        if (self.frame_len >= frame_chunk_len) {
-            const chunk = (self.frame_len - frame_chunk_len) / frame_chunk_len;
-            if (chunk == self.frame_chunks.items.len) {
-                const c = self.alloc.create([frame_chunk_len]Frame) catch return Trap.CallStackExhausted;
-                self.frame_chunks.append(self.alloc, c) catch {
-                    self.alloc.destroy(c);
-                    return Trap.CallStackExhausted;
-                };
-            }
-        }
-        self.frameAt(self.frame_len).* = frame;
+        if (self.frame_len >= frame_chunk_len) try self.growFrameChunks();
+        comptime std.debug.assert(@typeInfo(Frame).@"struct".fields.len == 9); // a new field is copied below
+        const slot = self.frameAt(self.frame_len);
+        slot.sig = frame.sig;
+        slot.locals = frame.locals;
+        slot.operand_base = frame.operand_base;
+        slot.pc = frame.pc;
+        slot.func = frame.func;
+        slot.done = frame.done;
+        slot.label_overflow = frame.label_overflow;
+        slot.label_len = frame.label_len;
         self.frame_len += 1;
+    }
+
+    /// Allocate the heap chunk that frame `frame_len` (>= `frame_chunk_len`)
+    /// falls in, if it is not there yet.
+    fn growFrameChunks(self: *Runtime) Trap!void {
+        const chunk = (self.frame_len - frame_chunk_len) / frame_chunk_len;
+        if (chunk < self.frame_chunks.items.len) return;
+        const c = self.alloc.create([frame_chunk_len]Frame) catch return Trap.CallStackExhausted;
+        self.frame_chunks.append(self.alloc, c) catch {
+            self.alloc.destroy(c);
+            return Trap.CallStackExhausted;
+        };
     }
 
     /// D-288 / ADR-0167: trap `CallStackExhausted` at the real per-OS
     /// native stack limit BEFORE the host stack SEGVs. The interp
-    /// recurses natively per wasm call; on the small (~1 MiB) Windows
-    /// stack the real ceiling sits BELOW the `max_frame_depth` guard, so
-    /// without this 128–256-deep recursion crashes instead of trapping.
+    /// recurses natively per wasm call; on every default stack (1 MiB
+    /// Windows, 8 MiB Mac/Linux) the real ceiling sits BELOW the
+    /// `max_frame_depth` guard, so without this deep recursion crashes
+    /// instead of trapping.
     /// `sp` is the caller's `@frameAddress()`. The limit is the CALLING
     /// thread's, computed lazily once per thread; a `0` (unsupported-
     /// platform) limit disables the check, leaving `max_frame_depth` as the

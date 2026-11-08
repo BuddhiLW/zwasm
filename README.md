@@ -9,15 +9,15 @@ A spec-compliant WebAssembly runtime written in Zig.
 
 [![CI](https://github.com/zwasm/zwasm/actions/workflows/ci.yml/badge.svg)](https://github.com/zwasm/zwasm/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/zwasm/zwasm)](https://github.com/zwasm/zwasm/releases)
-[![Zig](https://img.shields.io/badge/Zig-0.16.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org/)
+[![Zig](https://img.shields.io/badge/Zig-0.17.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org/)
 [![WebAssembly 3.0](https://img.shields.io/badge/WebAssembly-3.0-654ff0?logo=webassembly&logoColor=white)](https://webassembly.org/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 - **Full spec coverage** — WebAssembly 3.0 (all 9 proposals), spec testsuite
   green on macOS aarch64, Linux x86_64 and aarch64, and Windows x86_64. CI runs both
   engines; the JIT lane enumerates its known-wrong outcomes and gates on an
-  exact match. WASI 0.1, 0.2 (Component Model, on by default) and 0.3
-  (native async, opt-in).
+  exact match. WASI 0.1, 0.2 (Component Model) and 0.3 (native async),
+  all on by default.
 - **Three execution backends** — interpreter, JIT (arm64 + x86_64) and AOT
   (`.cwasm`), differentially tested against each other on every change.
   wasmtime is the external oracle for the interpreter and JIT; the AOT lane
@@ -89,15 +89,15 @@ out of scope for now (demand-driven).
 |-----------------------------------------------------------------------------------------------------------------|---------|----------------------------------------------------------|
 | Wasm 1.0                                                                                                        | ✅ 100% | spec testsuite green on the 3-OS CI matrix                |
 | Wasm 2.0 (multi-value, SIMD-128, bulk-memory, reference-types, non-trapping FP→int, sign-ext, mutable globals) | ✅ 100% | `skip-impl == 0`; bit-identical across hosts             |
-| Wasm 3.0 (GC, EH, tail-call, memory64, multi-memory, typed func refs, extended-const, relaxed-simd, custom annotations) | ✅ 100% | all 9 proposals, on the 3-OS CI matrix: the interpreter and JIT lanes are green (extended-const: unit-tested, its corpus lane is pending #217) |
+| Wasm 3.0 (GC, EH, tail-call, memory64, multi-memory, typed func refs, extended-const, relaxed-simd, custom annotations) | ✅ 100% | all 9 proposals, on the 3-OS CI matrix: the interpreter and JIT lanes are green (extended-const: unit-tested, no corpus lane; an imported global inside offset arithmetic is refused, #687) |
 
 ### WASI
 
 | Spec                                 | Status                    | Notes                                                                                                                                                                                                                                                                                                                                                         |
 |--------------------------------------|---------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | WASI 0.1 (preview1)                  | ✅ functional, both engines | args / env / preopened dirs / clock / random / fd I/O with an enforced rights model, on the interpreter, the JIT and AOT. Measured against the official `WebAssembly/wasi-testsuite` preview1 corpus by a lane that blocks `ci-required`; `adapters/zwasm.py` is upstream, so a clean checkout of the suite re-derives the result against a stock binary |
-| WASI 0.2 (preview2, Component Model) | ✅ functional, default-ON | real `wasm32-wasip2` Rust / TinyGo components run end-to-end (fs, sockets incl. TCP listeners, guest-defined resources); typed embedder API (introspection + `invokeTyped`); the Component Model spec corpus (incl. the official `assert_invalid` cases) is green in `test-all`; gated by `-Dwasi>=p2` (the default), `-Dwasi=p1` opts out |
-| WASI 0.3 (preview3, native async)    | ✅ 0.3.0 full coverage, opt-in (`-Dwasi=p3`) | all six WASI 0.3 proposals (0.3.0 released 2026-06-11; 0.3.1 and 0.3.2 change only the version strings, but a 0.3.1+ runtime must also accept the Component Model `map` type and `implements` annotation, which zwasm refuses: #611, #612) — `cli` / `clocks` / `random` / `filesystem` / `sockets` / `http` — on the Component Model's native async (`stream<T>` / `future<T>`, waitable-sets; async-lifted exports in the callback form, a stackful async lift is declined). Sockets (TCP and UDP) and http (client and the exported `handler`) are served end-to-end. Official `wasm32-wasip3` corpus **45/45 green on all three supported OSes** (`@unstable` interfaces excluded, as upstream gates them); the lane reconciles that count against the vendored corpus |
+| WASI 0.2 (preview2, Component Model) | ✅ functional, default-ON | real `wasm32-wasip2` Rust / TinyGo components run end-to-end (fs, sockets incl. TCP listeners and the `wasi:http` client behind `--allow-network`, guest-defined resources); typed embedder API (introspection + `invokeTyped`); the Component Model spec corpus (incl. the official `assert_invalid` cases) is green in `test-all`; gated by `-Dwasi>=p2` (the default is `p3`), `-Dwasi=p1` opts out |
+| WASI 0.3 (preview3, native async)    | ✅ 0.3.0 full coverage, default-ON (`-Dwasi=p2` opts out) | all six WASI 0.3 proposals (0.3.0 released 2026-06-11; 0.3.1 and 0.3.2 change only the version strings, and zwasm accepts the Component Model `map` type and `implements` annotation a 0.3.1+ runtime must) — `cli` / `clocks` / `random` / `filesystem` / `sockets` / `http` — on the Component Model's native async (`stream<T>` / `future<T>`, waitable-sets; async-lifted exports in the callback form, a stackful async lift is declined). Sockets (TCP and UDP) and http (client and the exported `handler`) are served end-to-end. Official `wasm32-wasip3` corpus **45/45 green on all three supported OSes** (`@unstable` interfaces excluded, as upstream gates them); the lane reconciles that count against the vendored corpus |
 
 All three execution paths do full WASI I/O — the interpreter, the JIT
 (`--engine jit`), and AOT (`.cwasm`). The JIT additionally
@@ -123,7 +123,7 @@ adversarial use-after-free test on aarch64 + x86_64.
 zwasm                                  # print version + build options
 zwasm run [options] <file.wasm|.cwasm> [args...] # run a module (WASI _start / main)
     [--invoke <name>[=a,b,…]]          #   run a named export; =args prints typed results
-    [--engine <interp|jit>]            #   default: auto (prefers JIT, interp fallback); interp|jit force one (both full WASI; jit adds SIMD)
+    [--engine <interp|jit>]            #   default: auto (prefers JIT, interp fallback); interp|jit force one (both full WASI; jit adds SIMD, interp refuses a SIMD module at instantiate)
     [--dir <host>[:<guest>]]           #   preopen a host directory for WASI
     [--env <KEY=VAL>]                  #   set a WASI env var (repeatable)
     [--fuel <N>]                       #   trap after a deterministic budget (error.OutOfFuel)
@@ -202,7 +202,7 @@ FFI-capable language, not just C.
 
 ```
 -Dwasm=v3_0|v2_0|v1_0       # default v3_0; lower levels omit later proposals
--Dwasi=none|p1|p2|p3        # default p2; ordered tier. p2 = Component Model / WASI-P2 host,
+-Dwasi=none|p1|p2|p3        # default p3; ordered tier. p2 = Component Model / WASI-P2 host,
                             #   p3 = + Preview-3 async. -Dwasi=p1 = lean build (~-8%)
 -Dengine=both|jit|interp    # default both
 -Dstrip=true|false          # default false
@@ -236,7 +236,7 @@ zig build -Dtarget=x86_64-windows-gnu
 The link line that goes with `static-lib`, and what each of its flags is for,
 is in [`docs/tutorial.md`](docs/tutorial.md) §5.
 
-**You need Zig 0.16.0 and [`wasm-tools`](https://github.com/bytecodealliance/wasm-tools)**
+**You need Zig 0.17.0 and [`wasm-tools`](https://github.com/bytecodealliance/wasm-tools)**
 (pinned in [`.github/versions.lock`](.github/versions.lock); the build
 generates `test/spec/spectest.wasm` with it). Multi-OS verification is handled
 automatically by CI on every pull request. The full development story
@@ -244,7 +244,7 @@ automatically by CI on every pull request. The full development story
 **[`docs/development.md`](docs/development.md)**; the contribution flow is in
 [`.github/CONTRIBUTING.md`](.github/CONTRIBUTING.md).
 
-Nix is optional: `nix develop` (or direnv) loads the pinned Zig 0.16.0
+Nix is optional: `nix develop` (or direnv) loads the pinned Zig 0.17.0
 and tool surface (`flake.nix`: hyperfine, wasm-tools, wasmtime, yq-go,
 lldb, nasm).
 
@@ -269,7 +269,7 @@ src/         Zig sources (parse/ validate/ ir/ runtime/ instruction/ feature/
              engine/ interp/ wasi/ api/ cli/ diagnostic/ support/ platform/)
 include/     Public C headers (wasm.h / wasi.h / zwasm.h)
 build.zig    Build script
-flake.nix    Nix dev shell pinned to Zig 0.16.0
+flake.nix    Nix dev shell pinned to Zig 0.17.0
 docs/        Tutorial + API reference + benchmarks
 .dev/        ROADMAP + handover + ADRs + lessons + setup notes
 .claude/     Claude Code settings, skills, rules (auto-loaded)

@@ -18,6 +18,17 @@ the fixture's bump allocator never grows memory.
 All three export `call: func(op: string, request: string) -> string` (WIT in
 `preview1_adapted.wit`), which returns `request`.
 
+The adapters are the wasmtime v50.0.0 release assets
+(<https://github.com/bytecodealliance/wasmtime/releases/tag/v50.0.0>):
+
+| asset | sha256 |
+|---|---|
+| [`wasi_snapshot_preview1.reactor.wasm`](https://github.com/bytecodealliance/wasmtime/releases/download/v50.0.0/wasi_snapshot_preview1.reactor.wasm) | `73b01f85e42e99c890efbbf619cd765e04e5809da36d976b87fc64abd87f5812` |
+| [`wasi_snapshot_preview1.command.wasm`](https://github.com/bytecodealliance/wasmtime/releases/download/v50.0.0/wasi_snapshot_preview1.command.wasm) | `b3de00ac47528237211c6404b4a7e4235a67878665dc3e8853071908c3127a85` |
+
+The recipe below with these two files rebuilds all three fixtures byte for
+byte.
+
 Rebuild (wasm-tools 1.262.0):
 
 ```sh

@@ -5,7 +5,7 @@ zwasm on a fresh machine. If any other document disagrees with this one about
 the development environment, this one wins (design/architecture questions are
 owned by [`.dev/ROADMAP.md`](../.dev/ROADMAP.md)).
 
-**The short version: you need Zig 0.16.0 and `wasm-tools`.** The authoritative
+**The short version: you need Zig 0.17.0 and `wasm-tools`.** The authoritative
 test gate is GitHub CI, which runs the 3-OS matrix on every pull request
 (every leg blocking) — you do not need multiple machines, SSH hosts,
 Nix, or any maintainer-specific setup to contribute.
@@ -21,7 +21,7 @@ zig build test-all       # every enabled test layer (what CI runs)
 zig fmt src/             # format before committing
 ```
 
-`zig version` must print `0.16.0` — the project pins it exactly
+`zig version` must print `0.17.0` — the project pins it exactly
 (`.github/versions.lock`, `flake.nix`). Get it from
 [ziglang.org/download](https://ziglang.org/download/) or via the Nix shell
 below.
@@ -33,14 +33,14 @@ The complete `-D` surface (`zig build --help` is always authoritative):
 | Option | Values (default first) | Effect |
 |---|---|---|
 | `-Dwasm` | `v3_0` / `v2_0` / `v1_0` | Wasm spec level; lower levels strip later proposals (incl. GC/EH at `v1_0`/`v2_0`) via compile-time DCE |
-| `-Dwasi` | `p2` / `p3` / `p1` / `none` | Ordered WASI tier. `p2` = Component Model + WASI-P2 host; `p3` adds Preview-3 native async; `p1` is the lean opt-out (strips the whole component subsystem) |
+| `-Dwasi` | `p3` / `p2` / `p1` / `none` | Ordered WASI tier. `p2` = Component Model + WASI-P2 host; `p3` adds Preview-3 native async; `p1` is the lean opt-out (strips the whole component subsystem) |
 | `-Dengine` | `both` / `jit` / `interp` | Engine selection compiled in |
 | `-Dstrip` | `false` / `true` | Strip debug info from the CLI binary |
 | `-Dsanitize` | `off` / `address` / `thread` | ASan+UBSan / TSan (Mac + Linux only — a Windows target rejects a non-`off` value at configure time rather than silently building unsanitized) |
 | `-Dcompiler-rt` | `false` / `true` | Bundle Zig compiler-rt into `libzwasm.a` for non-Zig linkers (`__zig_probe_stack` etc.) |
 | `-Dtrace-ringbuffer` | `false` / `true` | Compile in the diagnostic trace ringbuffer |
 | `-Dtrace-stackprobe` | `false` / `true` | Compile in the JIT stack-probe diagnostic prints |
-| `-Dtest-filter` | (string) | Run only matching tests in `zig build test-wasi-p3` |
+| `-Dtest-filter` | (string) | Run only matching tests in every unit suite (`zig build test`, `test-wasi-p2`) |
 
 There is no separate GC flag: WasmGC ships with `-Dwasm=v3_0` (the default),
 and the wasm level is the strip lever.
@@ -49,7 +49,7 @@ and the wasm level is the strip lever.
 
 | Tool | Status | Used for |
 |---|---|---|
-| Zig 0.16.0 (exact) | **required** | everything |
+| Zig 0.17.0 (exact) | **required** | everything |
 | git | **required** | everything |
 | [wasmtime](https://wasmtime.dev/) | optional | differential oracle in some suites — absent = those comparisons **skip**, never fail |
 | Nix (flakes) | optional | reproducible dev shell (`nix develop`), fixture regeneration shells |
@@ -68,11 +68,11 @@ in the `gen` shells (MoonBit is installed by hand:
 
 | Command | What it runs |
 |---|---|
-| `zig build test` | unit tests (all zones) |
+| `zig build test` | unit tests (all zones), incl. the official `wasm32-wasip3` conformance corpus |
 | `zig build test-spec` | Wasm spec testsuite (1.0/2.0/3.0) |
 | `zig build test-wasi-p1` | WASI 0.1 fixture suite |
 | `zig build test-wasi-p1-official` | official wasi-testsuite `wasm32-wasip1` corpus, `interp` + `jit` lanes. **Not in `test-all`** — see below |
-| `zig build test-wasi-p3` | WASI 0.3 (Component-Model async) incl. the official conformance corpus |
+| `zig build test-wasi-p2` | unit tests of the `-Dwasi=p2` build (no WASI 0.3 async) |
 | `zig build test-realworld` / `test-realworld-run` | real-world `.wasm` fixtures (parse / run) |
 | `zig build test-all` | all of the above except `test-wasi-p1-official` (the CI core gate) |
 | `zig build lint -- --max-warnings 0` | project linter |
@@ -123,7 +123,8 @@ is `scripts/gate_exclusions.regex`) skip the heavy 3-OS legs automatically and
 are gated by the fast `doc-truth` job instead. The decision is per push, not
 per PR: a doc-only push rides on the previous head's `ci-required` when that
 succeeded, and pays in full after a failed or cancelled one; the merge queue's
-own run gates the merged tree in full regardless (ADR-0227).
+own run gates the merged tree regardless, by running the gate on it or by
+proving it identical to a tree the PR run gated (ADR-0227).
 
 To run what CI runs, locally, on your own machine — the script defines the
 leg's content except for the one blocking step beside it:
@@ -140,9 +141,14 @@ zig build test-wasi-p1-official            # the blocking step outside the scrip
 Releases are cut by hand, by a maintainer, and never by automation acting on
 its own (ADR-0156). Three manual steps; the rest is the `release` workflow.
 
-1. **Bump `.version` in `build.zig.zon`.** SemVer against the previous tag —
-   `git log v<previous>..main --no-merges` is the input to that call.
-2. **Add the CHANGELOG section** for the new version, dated.
+1. **Dispatch `release_prep`** with the version:
+   `gh workflow run release_prep.yml --repo zwasm/zwasm -f version=X.Y.Z`.
+   SemVer against the previous tag — `git log v<previous>..main --no-merges`
+   is the input to that call. It folds `changelog.d/` into a dated CHANGELOG
+   section, bumps `.version` in `build.zig.zon`, and pushes the commit as
+   `release/vX.Y.Z`; its job summary prints the `gh pr create` line.
+2. **Merge the release PR through the queue.** Edit the section on that
+   branch first if it needs it.
 3. **Push the tag.** `git tag -a vX.Y.Z -m "<one-paragraph summary>" &&
    git push origin vX.Y.Z`. Annotated, on the merge commit of the release
    PR: the message is what `git show vX.Y.Z` prints, and it is the only

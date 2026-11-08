@@ -3,7 +3,7 @@
 //!
 //! Per ADR-0023 §3 P-D: extracted from the previous
 //! `runtime/runtime.zig` so each WASM Spec §4.2 concept owns its
-//! file. `max_operand_stack` / `max_frame_stack` /
+//! file. `max_operand_stack` / `frame_chunk_len` /
 //! `max_label_stack` constants live here because they bound the
 //! frame's inline buffers; per ROADMAP §P3 (cold-start: no
 //! per-call allocation) the buffers are inline-fixed.
@@ -32,8 +32,6 @@ pub const frame_chunk_len: u32 = 256;
 /// runtimes nest deeper than the old fixed 256 during their own init, so the
 /// default sits well above it.
 pub const default_max_frame_depth: u32 = 16 * 1024;
-/// The inline frame capacity (kept for callers sized against it).
-pub const max_frame_stack: u32 = frame_chunk_len;
 /// Inline per-frame label capacity (zero-alloc common case). Frames
 /// nesting control deeper than this spill into `Frame.label_overflow`
 /// (D-242) — keeps the common Frame small so per-call copies stay cheap.

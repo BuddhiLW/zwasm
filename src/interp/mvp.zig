@@ -46,8 +46,8 @@ const build_options = @import("build_options");
 /// 3.0-only relaxation; sub-3.0 builds require exact `sigEq`. Gating the
 /// `concreteReaches` arm behind this comptime const keeps the 3.0 symbol out of
 /// `-Dwasm=v1_0|v2_0` binaries (ADR-0073 "absent from binary"; ADR-0129 leak fix).
-const wasm_v3_plus = @intFromEnum(build_options.wasm_level) >=
-    @intFromEnum(@TypeOf(build_options.wasm_level).v3_0);
+const wasm_v3_plus = @backingInt(build_options.wasm_level) >=
+    @backingInt(@TypeOf(build_options.wasm_level).v3_0);
 
 const dispatch = @import("../ir/dispatch_table.zig");
 const dbg = @import("../support/dbg.zig");
@@ -139,7 +139,7 @@ pub fn register(table: *DispatchTable) void {
 }
 
 inline fn op(t: ZirOp) usize {
-    return @intFromEnum(t);
+    return @backingInt(t);
 }
 
 // ============================================================
@@ -396,7 +396,7 @@ fn callOp(c: *InterpCtx, instr: *const ZirInstr) anyerror!void {
         if (rt.host_calls[idx]) |hc| {
             // D-331A: fingerprint linear memory at every host-call boundary so an
             // interp trace can be diffed against the JIT's fd_write/poll_oneoff hooks.
-            dbg.print("mem.cksum", "interp {d} {x}", .{ idx, dbg.fnv1a(rt.memory) });
+            if (dbg.on("mem.cksum")) dbg.print("mem.cksum", "interp {d} {x}", .{ idx, dbg.fnv1a(rt.memory) });
             hc.fn_ptr(rt, hc.ctx) catch |err| {
                 // Cross-module EH (10.E-eh-tail cycle 120): a cross-
                 // module call's thunk transfers an uncaught throw into
@@ -699,8 +699,8 @@ inline fn sigEq(a: zir.FuncType, b: zir.FuncType) bool {
 pub fn invoke(rt: *Runtime, table: *const DispatchTable, callee: *const zir.ZirFunc) anyerror!void {
     // D-288 / ADR-0167: each wasm call recurses on the host stack here
     // (~8 KiB/frame). Trap CallStackExhausted at the real per-OS native
-    // limit BEFORE a SEGV (the binding guard on the small Windows stack,
-    // where ~128 < the frame_buf[256] cap).
+    // limit BEFORE a SEGV. On every default stack this binds before the
+    // `max_frame_depth` cap (~960 deep on 8 MiB, ~100 on 1 MiB).
     try rt.checkNativeStackLimit(@frameAddress());
     try rt.checkInterrupt(); // ADR-0179 #3a: host-requested timeout/cancel
     const params_len = callee.sig.params.len;

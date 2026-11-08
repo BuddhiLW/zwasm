@@ -135,10 +135,10 @@ pub const Linker = struct {
         /// D-201b — cross-instance table alias. Holds the exporter's
         /// `TableInstance` (value; its `refs` slice header aliases the
         /// shared backing, so `elem`/`table.set` writes are visible to
-        /// both modules). Caller keeps the source instance alive. NOTE:
-        /// a cross-module `table.grow` (refs realloc) would stale this
-        /// snapshot — *TableInstance sharing (cf. D-199 memory) is the
-        /// follow-up if a grow-across-modules fixture needs it.
+        /// both modules). Caller keeps the source instance alive. A grow
+        /// on either side would realloc that backing under the other, so
+        /// both decline it (#449, `TableInstance.host_imported`) until
+        /// they share one `*TableInstance`, as D-199 memory does.
         table_alias: TableAlias,
     };
 
@@ -158,6 +158,9 @@ pub const Linker = struct {
     pub const TableAlias = struct {
         /// D-201b — the exporter's `TableInstance` (refs slice aliased).
         inst: _runtime.TableInstance,
+        /// #449 — the exporter's own `TableInstance`, so the bind can mark
+        /// it too; null when `defineTable` was handed only a value.
+        source: ?*_runtime.TableInstance = null,
     };
 
     pub const CrossModuleFuncEntry = struct {
@@ -310,7 +313,7 @@ pub const Linker = struct {
         err_map: ?_marshal.HostErrorMap,
     ) !void {
         const fn_info = @typeInfo(Sig).@"fn";
-        if (fn_info.params.len == 0 or (fn_info.params[0].type orelse return error.SignatureMismatch) != *Caller) {
+        if (fn_info.param_types.len == 0 or (fn_info.param_types[0] orelse return error.SignatureMismatch) != *Caller) {
             @compileError("Linker.defineFunc: host fn must take *Caller as first param");
         }
         const Ctx = _marshal.HostFnCtx(Sig);
@@ -419,11 +422,25 @@ pub const Linker = struct {
     /// instance's `rt.tables[idx]` (value; its `refs` slice aliases the
     /// shared backing, so `elem`/`table.set` writes are mutually
     /// visible). Caller keeps the source instance alive.
+    ///
+    /// A table passed by value declines to grow on the importer's side
+    /// only: a grow by the exporter leaves the importer reading a freed
+    /// buffer (#449). `defineTableInstance` declines it on both.
     pub fn defineTable(self: *Linker, module: []const u8, name: []const u8, inst: _runtime.TableInstance) !void {
         try self.entries.append(self.engine.alloc, .{
             .module = module,
             .name = name,
             .payload = .{ .table_alias = .{ .inst = inst } },
+        });
+    }
+
+    /// `defineTable` over the exporter's own `&rt.tables[idx]`, so that once
+    /// the import is bound neither side grows the table (#449).
+    pub fn defineTableInstance(self: *Linker, module: []const u8, name: []const u8, inst: *_runtime.TableInstance) !void {
+        try self.entries.append(self.engine.alloc, .{
+            .module = module,
+            .name = name,
+            .payload = .{ .table_alias = .{ .inst = inst.*, .source = inst } },
         });
     }
 
@@ -584,7 +601,7 @@ pub const Linker = struct {
                 },
                 .table => {
                     if (exp.idx >= source_rt.tables.len) return error.UnknownImport;
-                    try self.defineTable(module, exp.name, source_rt.tables[exp.idx]);
+                    try self.defineTableInstance(module, exp.name, &source_rt.tables[exp.idx]);
                 },
                 .tag => try self.defineCrossModuleTag(module, exp.name, source_inst, exp.idx),
             }
@@ -768,14 +785,19 @@ pub const Linker = struct {
                             .table_alias => |t| t,
                             else => return error.ImportKindMismatch,
                         };
+                        // #449 — read the source at bind, not at define, and
+                        // mark the copy; `host_source` marks the source.
+                        var shared = if (alias.source) |src| src.* else alias.inst;
+                        shared.host_imported = true;
                         bindings_list.append(scratch, .{
                             .table = .{
-                                .instance = alias.inst,
-                                .source_elem_type = alias.inst.elem_type,
-                                .source_min = @intCast(alias.inst.refs.len),
+                                .instance = shared,
+                                .host_source = alias.source,
+                                .source_elem_type = shared.elem_type,
+                                .source_min = @intCast(shared.refs.len),
                                 // table64 source max (u64) narrowed to the u32 binding field
                                 // (saturate — cross-module i64-table import limit).
-                                .source_max = if (alias.inst.max) |m| (std.math.cast(u32, m) orelse std.math.maxInt(u32)) else null,
+                                .source_max = if (shared.max) |m| (std.math.cast(u32, m) orelse std.math.maxInt(u32)) else null,
                             },
                         }) catch return error.OutOfMemory;
                     },
@@ -950,6 +972,153 @@ test "Linker.defineInstance: a tag export is registered, and a tag import links 
     defer mod_b.deinit();
     var inst_b = try lk.instantiate(&mod_b, .{ .engine = .interp });
     defer inst_b.deinit();
+}
+
+test "Linker.instantiate: an imported table declines table.grow on both sides (#449)" {
+    // A: (table (export "t") 1 funcref)
+    //    (func (export "grow") (result i32) ref.null func i32.const 4 table.grow 0)
+    //    (func (export "size") (result i32) table.size 0)
+    const a_bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60,
+        0x00, 0x01, 0x7f, 0x03, 0x03, 0x02, 0x00, 0x00, 0x04, 0x04, 0x01, 0x70,
+        0x00, 0x01, 0x07, 0x13, 0x03, 0x01, 0x74, 0x01, 0x00, 0x04, 0x67, 0x72,
+        0x6f, 0x77, 0x00, 0x00, 0x04, 0x73, 0x69, 0x7a, 0x65, 0x00, 0x01, 0x0a,
+        0x11, 0x02, 0x09, 0x00, 0xd0, 0x70, 0x41, 0x04, 0xfc, 0x0f, 0x00, 0x0b,
+        0x05, 0x00, 0xfc, 0x10, 0x00, 0x0b,
+    };
+    // B: (import "e" "t" (table 1 funcref)) with the same "grow" and "size",
+    //    and (func (export "get0") (result i32) i32.const 0 table.get 0 ref.is_null)
+    const b_bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60,
+        0x00, 0x01, 0x7f, 0x02, 0x09, 0x01, 0x01, 0x65, 0x01, 0x74, 0x01, 0x70,
+        0x00, 0x01, 0x03, 0x04, 0x03, 0x00, 0x00, 0x00, 0x07, 0x16, 0x03, 0x04,
+        0x67, 0x72, 0x6f, 0x77, 0x00, 0x00, 0x04, 0x73, 0x69, 0x7a, 0x65, 0x00,
+        0x01, 0x04, 0x67, 0x65, 0x74, 0x30, 0x00, 0x02, 0x0a, 0x19, 0x03, 0x09,
+        0x00, 0xd0, 0x70, 0x41, 0x04, 0xfc, 0x0f, 0x00, 0x0b, 0x05, 0x00, 0xfc,
+        0x10, 0x00, 0x0b, 0x07, 0x00, 0x41, 0x00, 0x25, 0x00, 0xd1, 0x0b,
+    };
+    var eng = try _zwasm.Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var mod_a = try eng.compile(&a_bytes);
+    defer mod_a.deinit();
+    var mod_b = try eng.compile(&b_bytes);
+    defer mod_b.deinit();
+
+    {
+        var inst_a = try mod_a.instantiate(.{ .engine = .interp });
+        defer inst_a.deinit();
+        var lk = eng.linker();
+        defer lk.deinit();
+        try lk.defineInstance("e", &inst_a);
+        var inst_b = try lk.instantiate(&mod_b, .{ .engine = .interp });
+        defer inst_b.deinit();
+
+        try testing.expectEqual(@as(i32, -1), try inst_a.typedFunc(fn () i32, "grow").call(.{}));
+        try testing.expectEqual(@as(i32, -1), try inst_b.typedFunc(fn () i32, "grow").call(.{}));
+        try testing.expectEqual(@as(i32, 1), try inst_a.typedFunc(fn () i32, "size").call(.{}));
+        try testing.expectEqual(@as(i32, 1), try inst_b.typedFunc(fn () i32, "size").call(.{}));
+        try testing.expectEqual(@as(i32, 1), try inst_b.typedFunc(fn () i32, "get0").call(.{}));
+    }
+    {
+        // A value handed to `defineTable` reaches only the importer's copy.
+        var inst_a = try mod_a.instantiate(.{ .engine = .interp });
+        defer inst_a.deinit();
+        var lk = eng.linker();
+        defer lk.deinit();
+        try lk.defineTable("e", "t", inst_a.handle.runtime.?.tables[0]);
+        var inst_b = try lk.instantiate(&mod_b, .{ .engine = .interp });
+        defer inst_b.deinit();
+
+        try testing.expectEqual(@as(i32, -1), try inst_b.typedFunc(fn () i32, "grow").call(.{}));
+        try testing.expectEqual(@as(i32, 1), try inst_b.typedFunc(fn () i32, "size").call(.{}));
+    }
+}
+
+test "Linker.instantiate: an element item `global.get` of an imported funcref global fills the table (#662)" {
+    // A: (func (result i32) i32.const 42) (global (export "f") funcref (ref.func 0))
+    const a_bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, // type: ()->(i32)
+        0x03, 0x02, 0x01, 0x00, // func: 1× type 0
+        0x06, 0x06, 0x01, 0x70, 0x00, 0xd2, 0x00, 0x0b, // global: funcref, ref.func 0
+        0x07, 0x05, 0x01, 0x01, 'f', 0x03, 0x00, // export "f"=global0
+        0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x2a, 0x0b, // code: i32.const 42
+    };
+    // B: (import "m" "f" (global funcref)) (table 1 funcref)
+    //    (elem (i32.const 0) funcref (global.get 0))
+    //    (func (export "call_imported_elem") (result i32) (call_indirect (type 0) (i32.const 0)))
+    const b_bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, // type: ()->(i32)
+        0x02, 0x08, 0x01, 0x01, 'm', 0x01, 'f', 0x03, 0x70, 0x00, // import m.f (global funcref)
+        0x03, 0x02, 0x01, 0x00, // func: 1× type 0
+        0x04, 0x04, 0x01, 0x70, 0x00, 0x01, // table: funcref, min 1
+        0x07, 0x16, 0x01, 0x12, 'c',  'a',
+        'l',  'l',  '_',  'i',  'm',  'p',
+        'o',  'r',  't',  'e',  'd',  '_',
+        'e',  'l',  'e',  'm',  0x00, 0x00,
+        0x09, 0x09, 0x01, 0x04, 0x41, 0x00, 0x0b, 0x01, 0x23, 0x00, 0x0b, // elem: active, funcref exprs [global.get 0]
+        0x0a, 0x09, 0x01, 0x07, 0x00, 0x41, 0x00, 0x11, 0x00, 0x00, 0x0b, // code: call_indirect type 0 table 0
+    };
+    var eng = try _zwasm.Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var mod_a = try eng.compile(&a_bytes);
+    defer mod_a.deinit();
+    var inst_a = try mod_a.instantiate(.{ .engine = .interp });
+    defer inst_a.deinit();
+
+    var lk = eng.linker();
+    defer lk.deinit();
+    try lk.defineInstance("m", &inst_a);
+
+    var mod_b = try eng.compile(&b_bytes);
+    defer mod_b.deinit();
+    var inst_b = try lk.instantiate(&mod_b, .{ .engine = .interp });
+    defer inst_b.deinit();
+    try testing.expectEqual(@as(i32, 42), try inst_b.typedFunc(fn () i32, "call_imported_elem").call(.{}));
+}
+
+test "Linker.instantiate: an element offset past the table end is refused, an imported -1 and an empty segment alike" {
+    // A: (global (export "g") i64 (i64.const -1))
+    const a_bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x06, 0x06, 0x01, 0x7e, 0x00, 0x42, 0x7f, 0x0b, // global: i64, i64.const -1
+        0x07, 0x05, 0x01, 0x01, 'g', 0x03, 0x00, // export "g"=global0
+    };
+    // B: (import "m" "g" (global i64)) (table i64 1 funcref)
+    //    (elem (table 0) (global.get 0) func 0) (func)
+    const b_bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type: ()->()
+        0x02, 0x08, 0x01, 0x01, 'm', 0x01, 'g', 0x03, 0x7e, 0x00, // import m.g (global i64)
+        0x03, 0x02, 0x01, 0x00, // func: 1× type 0
+        0x04, 0x04, 0x01, 0x70, 0x04, 0x01, // table: funcref, i64 index, min 1
+        0x09, 0x09, 0x01, 0x02, 0x00, 0x23, 0x00, 0x0b, 0x00, 0x01, 0x00, // elem: active table 0, offset global.get 0, [func 0]
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b, // code
+    };
+    // C: (table 1 funcref) (elem (i32.const 2) func) — empty, but past the end.
+    const c_bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x04, 0x04, 0x01, 0x70, 0x00, 0x01, // table: funcref, min 1
+        0x09, 0x06, 0x01, 0x00, 0x41, 0x02, 0x0b, 0x00, // elem: active, offset 2, no items
+    };
+    var eng = try _zwasm.Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var mod_a = try eng.compile(&a_bytes);
+    defer mod_a.deinit();
+    var inst_a = try mod_a.instantiate(.{ .engine = .interp });
+    defer inst_a.deinit();
+
+    var lk = eng.linker();
+    defer lk.deinit();
+    try lk.defineInstance("m", &inst_a);
+
+    var mod_b = try eng.compile(&b_bytes);
+    defer mod_b.deinit();
+    try testing.expectError(error.InstantiateFailed, lk.instantiate(&mod_b, .{ .engine = .interp }));
+    var mod_c = try eng.compile(&c_bytes);
+    defer mod_c.deinit();
+    try testing.expectError(error.InstantiateFailed, lk.instantiate(&mod_c, .{ .engine = .interp }));
 }
 
 test "start function may be an IMPORTED host func (wit-component start-shim shape)" {

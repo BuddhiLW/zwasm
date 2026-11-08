@@ -11,7 +11,7 @@ fn writeStr(s: []const u8) void {
 
 pub fn main() void {
     const N = 200;
-    var sieve = [_]bool{true} ** (N + 1);
+    var sieve: [N + 1]bool = @splat(true);
     sieve[0] = false;
     sieve[1] = false;
     var i: usize = 2;
@@ -26,9 +26,9 @@ pub fn main() void {
     while (k <= N) : (k += 1) {
         if (!sieve[k]) continue;
         count += 1;
-        const s = std.fmt.bufPrint(&buf, "{d}\n", .{k}) catch return;
+        const s = std.mem.print(&buf, "{d}\n", .{k}) catch return;
         writeStr(s);
     }
-    const cs = std.fmt.bufPrint(&buf, "count={d}\n", .{count}) catch return;
+    const cs = std.mem.print(&buf, "count={d}\n", .{count}) catch return;
     writeStr(cs);
 }

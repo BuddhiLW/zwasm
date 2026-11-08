@@ -58,8 +58,8 @@ const build_options = @import("build_options");
 // dispatch_collector's comptime `enabledByBuild`), so it needs an explicit
 // `if (comptime wasm_v3_plus)` to DCE in `-Dwasm=v1_0` — else the x86_64 v1_0
 // binary retains dead wasm_3_0 codegen (caught by check_build_dce on x86).
-const wasm_v3_plus = @intFromEnum(build_options.wasm_level) >=
-    @intFromEnum(@TypeOf(build_options.wasm_level).v3_0);
+const wasm_v3_plus = @backingInt(build_options.wasm_level) >=
+    @backingInt(@TypeOf(build_options.wasm_level).v3_0);
 const jit_abi = @import("../shared/jit_abi.zig");
 const exception_table = @import("../shared/exception_table.zig");
 const types = @import("types.zig");
@@ -92,13 +92,9 @@ const rbpLoadR32 = rbp_disp.rbpLoadR32;
 const rbpStoreR64 = rbp_disp.rbpStoreR64;
 const rbpLoadR64 = rbp_disp.rbpLoadR64;
 const rbpStoreXmmF32 = rbp_disp.rbpStoreXmmF32;
-const rbpLoadXmmF32 = rbp_disp.rbpLoadXmmF32;
 const rbpStoreXmmF64 = rbp_disp.rbpStoreXmmF64;
-const rbpLoadXmmF64 = rbp_disp.rbpLoadXmmF64;
 const rbpStoreXmmV128 = rbp_disp.rbpStoreXmmV128;
-const rbpLoadXmmV128 = rbp_disp.rbpLoadXmmV128;
 const rspSub = rbp_disp.rspSub;
-const rspAdd = rbp_disp.rspAdd;
 
 const Allocator = std.mem.Allocator;
 const ZirFunc = zir.ZirFunc;
@@ -114,8 +110,6 @@ pub const deinit = types.deinit;
 
 // Internal types from `label.zig` (D-030 chunk-a). Aliased so the
 // dispatch loop body keeps reading like the pre-split code.
-const LabelKind = label_mod.LabelKind;
-const Fixup = label_mod.Fixup;
 const Label = label_mod.Label;
 
 // Setup-phase helpers extracted to `emit_setup.zig` per ADR-0081
@@ -126,7 +120,6 @@ const setup = @import("emit_setup.zig");
 const stack_limit = @import("../../../platform/stack_limit.zig");
 const computeOutgoingMaxBytes = setup.computeOutgoingMaxBytes;
 const computeLocalLayout = setup.computeLocalLayout;
-const LocalLayout = setup.LocalLayout;
 
 // `win64V128ScratchBase` helper lives in `op_call.zig` (used by
 // the caller-side marshal).
@@ -501,7 +494,7 @@ pub fn compile(
             break :param_marshal;
         }
         var int_arg_idx: usize = if (return_is_memory_class) 2 else 1;
-        var fp_arg_idx: usize = if (abi.current_cc == .win64) 1 else 0;
+        var fp_arg_idx: usize = if (abi.current_cc == .win64) int_arg_idx else 0;
         // Per-overflow NSAA index for SysV. Mirror of
         // the caller-side counter in op_call.marshalCallArgs.
         // Both classes share the NSAA stream in declaration

@@ -913,7 +913,7 @@ fn installBoundaryTrampoline(
 /// Canonical ABI (`CanonicalABI.md` `Subtask.State`). RETURNED=2 means the
 /// callee resolved within the call (a synchronous completion); the minimal c-2b
 /// fixture's callee EXITs immediately, so the lowered call returns RETURNED.
-const SUBTASK_RETURNED: u32 = @intFromEnum(async_mod.SubtaskState.returned);
+const SUBTASK_RETURNED: u32 = @backingInt(async_mod.SubtaskState.returned);
 
 /// The async boundary trampoline's flattened core signature for a NO-RESULT
 /// async import (`canon lower … async` of `func()`): `() -> i32`, returning the
@@ -1258,6 +1258,7 @@ fn graphStreamNew(caller: *Caller) BoundaryError!u64 {
 /// them. A `count * elem_size` exceeding the inline buffer is a typed deferral.
 fn graphStreamWrite(caller: *Caller, handle: u32, ptr: u32, count: u32) BoundaryError!u32 {
     const ctx = caller.data(GraphFutureCtx);
+    if (count > async_mod.BUFFER_MAX_LENGTH) return error.BufferTooLong;
     try checkOwner(ctx, handle);
     const end = try ctx.as.streams.get(handle);
     const sh = try ctx.as.shared.get(end.shared);
@@ -1303,6 +1304,7 @@ fn graphStreamWrite(caller: *Caller, handle: u32, ptr: u32, count: u32) Boundary
 /// BLOCKED loudly (the pollSet path is d-c-2), never a silent 0.
 fn graphStreamRead(caller: *Caller, handle: u32, ptr: u32, count: u32) BoundaryError!u32 {
     const ctx = caller.data(GraphFutureCtx);
+    if (count > async_mod.BUFFER_MAX_LENGTH) return error.BufferTooLong;
     try checkOwner(ctx, handle);
     const end = try ctx.as.streams.get(handle);
     const sh = try ctx.as.shared.get(end.shared);
@@ -1310,6 +1312,9 @@ fn graphStreamRead(caller: *Caller, handle: u32, ptr: u32, count: u32) BoundaryE
         .stream => |*s| s,
         .future, .subtask => return error.Unreachable,
     };
+    // Spec `copy` builds the guest buffer before `end.copy`: a span past u32
+    // traps with the end still idle.
+    const span = std.math.cast(u32, @as(u64, count) * ctx.elem_size) orelse return error.OutOfBoundsStore;
     const step = try end.copy(st, &ctx.as.streams, handle, count);
     if (step.caller == .completed) {
         const n = step.caller.completed;
@@ -1326,8 +1331,7 @@ fn graphStreamRead(caller: *Caller, handle: u32, ptr: u32, count: u32) BoundaryE
         // readable end handle the guest then joins to its waitable set. Validate the
         // destination span up front so a bad (ptr,cap) traps at park time, not later.
         const mem = caller.memory() orelse return error.OutOfBoundsStore;
-        const span = @as(u64, count) * @as(u64, ctx.elem_size);
-        _ = mem.sliceAt(ptr, @intCast(span)) catch return error.OutOfBoundsStore;
+        _ = mem.sliceAt(ptr, span) catch return error.OutOfBoundsStore;
         ctx.as.pending_graph_reads.put(ctx.as.alloc, handle, .{ .mem = mem, .ptr = ptr, .cap = count, .elem_size = ctx.elem_size }) catch return error.OutOfMemory;
     }
     return step.code().encode();
@@ -1462,7 +1466,7 @@ fn canonIsByValueBlob(t: canon.CanonType) bool {
 /// to `defineFuncRaw`. Every flat-scalar/string/list boundary flattens to all-i32
 /// core words, so one static all-i32 array serves them all — no per-boundary
 /// allocation (D-305). Sized to the linker's raw-arity cap.
-const boundary_core_i32: [marshal.raw_max_words]zir.ValType = .{.i32} ** marshal.raw_max_words;
+const boundary_core_i32: [marshal.raw_max_words]zir.ValType = @splat(.i32);
 
 /// The resolved boundary shape: whether the func flattens to the all-i32 core
 /// signature the generic trampoline marshals, and its flattened param word count.
@@ -1662,7 +1666,8 @@ fn boundaryMarshal(caller: *Caller, bctx: *BoundaryCtx, args: []const RtValue) B
         const w0: u32 = @bitCast(marshalled[0].i32);
         const w1: u32 = @bitCast(marshalled[1].i32);
         const caller_mem: Memory = caller.memory() orelse return error.OutOfBoundsLoad;
-        const byte_count: u32 = w1 * bctx.list_elem_size;
+        // A byte count past u32 is past the end of memory as well: the same trap.
+        const byte_count = std.math.mul(u32, w1, bctx.list_elem_size) catch return error.OutOfBoundsLoad;
         const src = try caller_mem.sliceAt(w0, byte_count); // OOB read → OutOfBoundsLoad trap
         const tmp = try caller.allocator().dupe(u8, src);
         defer caller.allocator().free(tmp);
@@ -1891,4 +1896,42 @@ fn nthCoreModule(decoded: *const decode.Component, n: u32) ?[]const u8 {
         i += 1;
     }
     return null;
+}
+
+test "a graph stream copy of more than 2^28-1 elements traps" {
+    const testing = std.testing;
+    var as = try GraphAsync.init(testing.allocator);
+    defer as.deinit();
+    var fctx: GraphFutureCtx = .{ .as = &as, .elem_size = 1 };
+    // The count is refused before any memory is read.
+    var caller: Caller = .{ .rt = undefined, .host_data = &fctx };
+    const pair = try graphStreamNew(&caller);
+    try testing.expectError(error.BufferTooLong, graphStreamWrite(&caller, @intCast(pair >> 32), 0, async_mod.BUFFER_MAX_LENGTH + 1));
+    try testing.expectError(error.BufferTooLong, graphStreamRead(&caller, @truncate(pair), 0, async_mod.BUFFER_MAX_LENGTH + 1));
+}
+
+test "a graph list param or parked stream read whose byte size passes u32 traps as the access would" {
+    const testing = std.testing;
+    var eng = try Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var mod = try eng.compile("\x00asm\x01\x00\x00\x00\x05\x03\x01\x00\x01");
+    defer mod.deinit();
+    var lk = eng.linker();
+    defer lk.deinit();
+    var inst = try lk.instantiate(&mod, .{});
+    defer inst.deinit();
+    const rt = inst.handle.runtime.?;
+
+    // The list copy stops at the byte count, before it reaches the callee.
+    var bctx: BoundaryCtx = .{ .callee = undefined, .core_func_name = "", .core_inst = undefined, .func_type = .{ .params = &.{}, .result = null, .is_async = false }, .list_elem_size = 8 };
+    var caller: Caller = .{ .rt = rt, .host_data = &bctx };
+    try testing.expectError(error.OutOfBoundsLoad, boundaryMarshal(&caller, &bctx, &.{ .{ .i32 = 0 }, .{ .i32 = 0x2000_0000 } }));
+
+    var as = try GraphAsync.init(testing.allocator);
+    defer as.deinit();
+    var fctx: GraphFutureCtx = .{ .as = &as, .elem_size = 24 };
+    var fcaller: Caller = .{ .rt = rt, .host_data = &fctx };
+    const readable: u32 = @truncate(try graphStreamNew(&fcaller));
+    try testing.expectError(error.OutOfBoundsStore, graphStreamRead(&fcaller, readable, 0, async_mod.BUFFER_MAX_LENGTH));
+    try testing.expectEqual(async_mod.CopyState.idle, (try as.streams.get(readable)).state);
 }

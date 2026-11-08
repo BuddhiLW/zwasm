@@ -1,22 +1,15 @@
-//! Threaded-code dispatch loop (Phase 2 / §9.2 / 2.1).
+//! The interpreter's dispatch loop: `runFrame` is a `while` over
+//! `[]const ZirInstr` indexed by `pc`, calling each op's handler
+//! through `DispatchTable.interp`. Per ROADMAP §A12 the dispatcher
+//! does not branch on feature flags; an unbound slot is
+//! `Trap.Unreachable`.
 //!
-//! Looks up the handler for each `ZirInstr.op` in
-//! `DispatchTable.interp` and invokes it. Per ROADMAP §A12 the
-//! dispatcher does not branch on feature flags; an unbound slot
-//! is `Trap.Unreachable`. The full MVP handler set lands in
-//! §9.2 / 2.2 (feature/mvp/runtime.zig); 2.1 only delivers the
-//! dispatch primitive plus a smoke-shaped `run` outer loop.
+//! It diverges from wasm3's tail-called handlers (`m3_exec.c`): in
+//! Phase 2 the Zig 0.16 toolchain did not guarantee tail-call
+//! elimination. #680 holds the measured cost per dispatched
+//! instruction and the two layers of change.
 //!
-//! The Zig 0.16 toolchain does not guarantee tail-call elimination
-//! per the wasm3 idiom (`m3_exec.c` macro tower). zwasm v2's
-//! divergence: a plain `while` loop over `[]const ZirInstr` indexed
-//! by `pc`. The cost vs. wasm3-style threaded code is measurable
-//! and gets revisited in Phase 15 (§4.3 — "interpreter / JIT / AOT
-//! share one path"); for the Phase-2 spec gate, correctness is the
-//! priority over μs/op throughput.
-//!
-//! Zone 2 (`src/interp/`) — may import Zone 0 + 1 + sibling
-//! `src/runtime/runtime.zig`.
+//! Zone 2 — may import Zone 0 + 1 + sibling `src/runtime/runtime.zig`.
 
 const std = @import("std");
 
@@ -39,7 +32,7 @@ pub fn step(
     table: *const DispatchTable,
     instr: *const ZirInstr,
 ) anyerror!void {
-    const idx = @intFromEnum(instr.op);
+    const idx = @backingInt(instr.op);
     if (idx >= dispatch_table.N_OPS) return Trap.Unreachable;
     const handler = table.interp[idx] orelse return Trap.Unreachable;
     const saved_pc = if (rt.frame_len > 0) rt.currentFrame().pc else 0;
@@ -132,13 +125,23 @@ pub fn run(
     defer if (prev_trampoline_locals) |l| rt.alloc.free(l);
 
     // ADR-0232 D2: the frame this call owns joins the trap trace as an error
-    // leaves. Declared after the defer above so it runs first, while a tail
+    // leaves. Caught here, before the defers above run, while a tail
     // callee's locals are still allocated. At another depth the frame is not
     // this call's (one `run` pushed for itself, or a tail switch that failed
     // after popping). An exception may yet be caught, so it records nothing.
-    errdefer |err| if (err != error.UncaughtException and entry_depth > 0 and rt.frame_len == entry_depth)
-        trap_trace.record(rt.currentFrame());
+    runTrampoline(rt, table, initial_instrs, &prev_trampoline_locals) catch |err| {
+        if (err != error.UncaughtException and entry_depth > 0 and rt.frame_len == entry_depth)
+            trap_trace.record(rt.currentFrame());
+        return err;
+    };
+}
 
+fn runTrampoline(
+    rt: *Runtime,
+    table: *const DispatchTable,
+    initial_instrs: []const ZirInstr,
+    prev_trampoline_locals: *?[]runtime.Value,
+) anyerror!void {
     var instrs = initial_instrs;
     while (true) {
         const f = rt.currentFrame();
@@ -191,8 +194,8 @@ pub fn run(
         // referenced. The very first switch has nothing to free
         // (the popped frame's locals belong to the caller of
         // dispatch.run, not the trampoline).
-        if (prev_trampoline_locals) |l| rt.alloc.free(l);
-        prev_trampoline_locals = new_locals;
+        if (prev_trampoline_locals.*) |l| rt.alloc.free(l);
+        prev_trampoline_locals.* = new_locals;
 
         // Switch to the callee's instruction stream — without this
         // the outer loop would re-run the caller's instrs against
@@ -221,13 +224,13 @@ const StubHandlers = struct {
 
 fn buildSmokeTable() DispatchTable {
     var t = DispatchTable.init();
-    t.interp[@intFromEnum(ZirOp.nop)] = StubHandlers.nop;
-    t.interp[@intFromEnum(ZirOp.@"i32.const")] = StubHandlers.pushI32Const;
+    t.interp[@backingInt(ZirOp.nop)] = StubHandlers.nop;
+    t.interp[@backingInt(ZirOp.@"i32.const")] = StubHandlers.pushI32Const;
     return t;
 }
 
 test "runFrame stays 64-byte aligned (#541)" {
-    try testing.expectEqual(@as(?usize, 64), @typeInfo(@TypeOf(&runFrame)).pointer.alignment);
+    try testing.expectEqual(@as(?usize, 64), @typeInfo(@TypeOf(&runFrame)).pointer.attrs.@"align");
 }
 
 test "step: unbound op slot returns Trap.Unreachable" {
@@ -323,7 +326,7 @@ test "run: bubbles handler trap and stops iteration" {
     var rt = Runtime.init(testing.allocator);
     defer rt.deinit();
     var t = DispatchTable.init();
-    t.interp[@intFromEnum(ZirOp.@"i32.const")] = StubHandlers.pushI32Const;
+    t.interp[@backingInt(ZirOp.@"i32.const")] = StubHandlers.pushI32Const;
     // .nop slot left null → step returns Trap.Unreachable on the second instr.
 
     const instrs = [_]ZirInstr{

@@ -10,7 +10,148 @@ SemVer compatibility guarantees start at the first stable `v2.0.0` tag.
 
 ## [Unreleased]
 
+## [2.10.0] - 2026-11-08
+
+### Added
+
+- **A `wasm32-wasip2` guest that makes HTTP requests runs** (#564). The
+  `wasi:http/types@0.2.x` client resources and `outgoing-handler.handle` are
+  served behind `--allow-network` (2.9 refused the component with
+  `UnsupportedWasiImport`). Only the `http` scheme is sent; the server half
+  (`incoming-handler`) is not served.
+
 ### Changed
+
+- **zwasm runs WASI 0.3 async components by default** (#673). `zwasm run` on a
+  `wasm32-wasip3` component no longer needs a `-Dwasi=p3` build (2.9 exited 1).
+  `-Dwasi=p2` is the opt-out; `zig build test-wasi-p3` is now `test-wasi-p2`,
+  its unit suite. The ReleaseSafe binary grows 0.68 MB stripped on x86_64
+  Linux, mostly the HTTP/TLS client the 0.3 outgoing handler reaches.
+
+### Fixed
+
+- **A table exported by one instance and imported by another no longer grows
+  on either side** (#449). Before, a grow reallocated the buffer both read and
+  left the other instance reading freed memory; now `table.grow` returns `-1`
+  and `wasm_table_grow` returns `false`, as for an imported `wasm_table_new`
+  table. `Linker.defineTable` by value declines on the importer's side only.
+
+- **A component using the Component Model features WASI 0.3.1 adopted decodes
+  and runs** (#611, #612). A `map<K, V>` type is accepted, its key and value
+  validated as the spec says, and crosses the canonical ABI as
+  `list<tuple<K, V>>`; the `implements` / `version-suffix` / `external-id`
+  attributes on an import or export name are read and ignored, as type checking
+  ignores them.
+
+- **`zwasm run` on a component runs its `wasi:cli/run` export by name, and
+  `--invoke` reaches a component** (#622). It ran the first lifted export (on
+  `-Dwasi=p2`, even an async-only one) and dropped `--invoke`. Without one,
+  the component is refused with its exports listed. `--invoke NAME=args` takes
+  WIT scalar, char and string args.
+
+- **`invokeTyped` calls a single-module component that has no memory** (#676).
+  A component lifting only scalar signatures needs none, but the call failed
+  with `NoMemory` before it reached the guest.
+
+- **The JIT runs `memory.init`, `table.init`, `data.drop` and `elem.drop` on
+  any segment index** (#659). It declined data index 2048, elem index 1024
+  and, on arm64, drop index 4096, caps that only the arm64 immediate encoding
+  needed, so `--engine jit` and `zwasm compile` failed with `UnsupportedOp`.
+
+- **On the interpreter, an element segment can read an imported global** (#662,
+  #282). A `global.get` item of an imported funcref global, or an active
+  offset that reads an imported global, made instantiation fail.
+
+- **`wasm_module_imports` and `wasm_module_exports` list a memory64 memory
+  whose minimum does not fit `u32`** (#670). The import list came back empty
+  and `zwasm_module_imports_ex` returned `false`; the minimum now reports as
+  `0xffffffff`, as a table64 bound already did, since `wasm_limits_t` is `u32`.
+
+- **`zwasm run` on a component with a sync `wasi:cli/run` next to an async
+  export runs `run`** (#677). It ran the first async-lifted export instead. The
+  entry is `wasi:cli/run#run` by name, the highest generation first, else a
+  top-level `run` typed `func()` or `func() -> result`, each driven sync or
+  async as it is lifted.
+
+### Security
+
+- **On the interpreter, an active element segment whose table64 offset lies
+  past the table is refused** (#685). Before, an offset near 2^64 overflowed
+  the range check and the host process stopped.
+  [GHSA-ph9p-gw3q-7chp](https://github.com/zwasm/zwasm/security/advisories/GHSA-ph9p-gw3q-7chp).
+
+- **A component that nests types, declarations or components past zwasm's
+  caps, or chains func re-exports, is refused or resolved** (#682). Before, the
+  host process stopped. A type nests at most 100 levels, and a binary holds at
+  most 1000 nested components.
+  [GHSA-j6hh-4gp6-h45c](https://github.com/zwasm/zwasm/security/advisories/GHSA-j6hh-4gp6-h45c).
+
+### Known limitations
+
+- **WASI 0.2 and 0.3 `open-at` ignores the requested descriptor-flags and
+  opens every file read-write** (#254), so a host file the process may read
+  but not write cannot be opened.
+
+## [2.9.0] - 2026-10-31
+
+### Changed
+
+- **zwasm builds with Zig 0.17.0, and only 0.17.0** (#624). An embedder that
+  depends on the Zig package moves to 0.17.0 with this release; 0.16.0 remains
+  the Zig for 2.8.x (ADR-0235).
+
+- **`zwasm --version` spells the build mode as Zig 0.17 does** (#624):
+  `mode: safe` / `fast` / `small` / `debug` where 2.8 printed `ReleaseSafe` /
+  `ReleaseFast` / `ReleaseSmall` / `Debug`. The bench's `engine_build_mode`
+  and `runner_build_mode` fields change the same way.
+
+- **Interpreter calls are faster** (#624). Against 0.16.0 on one host, the
+  shootout `fib2` fixture takes 67% less time on the interpreter, `ctype` 48%
+  and `ratelimit` 19%.
+
+### Fixed
+
+- **On the interpreter, `nearest` rounds ties to even and quiets a signalling
+  NaN, and `min` / `max` return `-0` / `+0` for a pair of zeros** (#655). They
+  rounded ties away from zero, could return the signalling NaN, and took the
+  zero's sign from operand order. The Wasm 2.0 value-assert corpus now also
+  runs on the interpreter in `test-all`.
+
+- **A component built with the preview1 adapter (a Go reactor, for one)
+  places lowered results through the lower's own realloc** (#639). It used
+  `cabi_realloc`, and the adapter asserted. Lowers naming two different
+  reallocs now fail the build with `UnsupportedLowerRealloc`.
+
+### Known limitations
+
+- **The JIT declines `memory.init` on a data segment index of 2048 or more,
+  and `table.init` on an element segment index of 1024 or more** (#659).
+  `--engine jit` and `zwasm compile` fail with `UnsupportedOp`; the
+  interpreter runs the module, so `--engine interp` is the workaround.
+
+- **A `.cwasm` does not record which zwasm build produced it** (#665).
+  `zwasm run x.cwasm` accepts any artifact whose format version and arch
+  match and reads the runtime at the producing build's layout. Load a `.cwasm`
+  only into the binary that compiled it; the `--cache` directory is keyed by
+  version, so only development builds sharing one are exposed.
+
+## [2.8.1] - 2026-10-29
+
+### Security
+
+- **On the interpreter, a trapping float-to-int truncation of exactly 2^31,
+  2^32, 2^63 or 2^64 traps** (#656). It traps `integer overflow`, as the JIT
+  does; before, the host process stopped.
+  [GHSA-xcf3-8ww5-fwxh](https://github.com/zwasm/zwasm/security/advisories/GHSA-xcf3-8ww5-fwxh).
+
+## [2.8.0] - 2026-10-28
+
+### Changed
+
+- **A component reaches the host's network only when granted.** `zwasm run`
+  takes `--allow-network`, the Zig API `Host.allow_network`; both are off by
+  default. Without the grant, WASI 0.2 and 0.3 sockets, 0.3 name lookup and
+  0.3 outbound HTTP answer `access-denied`, in the default build too.
 
 - **The x86_64 JIT allocates eight general-purpose registers** (#503). The pool
   was the four callee-saved registers; RSI, RDI, R8 and R9 join it, since every
@@ -30,6 +171,7 @@ SemVer compatibility guarantees start at the first stable `v2.0.0` tag.
 - **A WASI 0.3.2 component binds** — the WASI 0.3.1 and 0.3.2 releases change
   only the package version strings; `test-all` now carries a component bound
   to the 0.3.2 names.
+
 - **A WASI command compiled once runs many times: `cli.run_prepared.PreparedWasi`.**
   `runWasmCapturedFull` validates, JIT-compiles and instantiates on every call,
   which for a Go wasip1 guest (5-12 MB) is seconds of compile per run.
@@ -58,6 +200,57 @@ SemVer compatibility guarantees start at the first stable `v2.0.0` tag.
   discarded.
 
 ### Fixed
+
+- **A ReleaseSafe build hashes the linear memory at a host call only when
+  `ZWASM_DEBUG=mem.cksum` asks** (#649). It hashed it on every WASI host call,
+  so the released binaries ran llama2.c on the JIT at 9.5 tok/s, a quarter of
+  ReleaseFast's 36.8; they now run it at 36.8.
+
+- **A failed 0.3 outbound HTTP exchange answers `internal-error`** (#643). The
+  host wrote ordinal 37, which is `configuration-error`, so the guest read a
+  misconfigured host where the exchange had failed.
+
+- **On x86_64-windows the JIT refuses a host call with one float param and
+  three results** (#618), as on the other targets. The param was passed in a
+  general-purpose register, so the function read a register nothing wrote.
+
+- **A JIT function with register-homed locals gives its float values every FP
+  register** (#600). The homes held the FP registers of the same slot ids, so
+  with four homes an x86_64 function had two XMM registers. llama2.c's scalar
+  build runs 2.3× faster on the JIT and the shootout `heapsort` fixture 14%.
+
+- **`--timeout` fires while the guest sleeps in `poll_oneoff`** (#598). The
+  clock wait slept in one call and read no interrupt flag, so a 5 s sleep under
+  `--timeout 500` ran 5 s and could exit 0. It now traps `interrupted` within
+  10 ms of the flag, also for `Instance.interrupt` and `zwasm_instance_interrupt`.
+
+- **The interpreter refuses a module holding an op it does not execute, at
+  instantiation** (#597). A SIMD op trapped as the guest's own `unreachable`,
+  and the default engine sent a SIMD module the JIT declined there. The failure
+  now names the op, and under the default engine the JIT's reason too.
+
+- **A v128 `select` whose second operand spills compiles** (#596). Both JIT
+  backends read that operand only from a register, so seven v128 values live
+  at one select (more on aarch64) declined the module on the JIT and in AOT.
+
+- **A 0.2 `descriptor.write` or file output-stream write completes or fails**
+  (#617). A short write was reported as the whole list written.
+
+- **A 0.2 or 0.3 `append-via-stream` writes at the file's end as of each
+  write** (#617, #627). It wrote at the size read when the stream was opened,
+  so a second append stream on the file, or a write through another
+  descriptor, was overwritten.
+
+- **A WASI 0.2 clock pollable is ready at its deadline** (#621).
+  `subscribe-duration` and `subscribe-instant` dropped their argument and
+  returned an always-ready pollable, so a guest's sleep returned at once: a
+  50 ms `subscribe-duration` then `poll` took 0.16 ms, where wasmtime takes
+  54.62 ms.
+
+- **On x86_64 Windows, a JIT function with more than two results reads its
+  float params from the registers the caller wrote** (#607). It read each one
+  from the XMM one position early, so the param held whatever that register
+  held, with no trap.
 
 - **Loading a `.cwasm` no longer costs call relocs × functions** (#613). The
   loader found each reloc's function by scanning the function table from the
@@ -352,6 +545,32 @@ SemVer compatibility guarantees start at the first stable `v2.0.0` tag.
   order with no explicit values, so the ordinals cannot drift from the
   declaration.
 
+### Security
+
+- **A component no longer reaches the host's network without a grant**; see
+  `--allow-network` under Changed.
+  [GHSA-cp4q-2jww-w63r](https://github.com/zwasm/zwasm/security/advisories/GHSA-cp4q-2jww-w63r).
+
+- **WASI 0.1 `fd_seek` answers `inval` for a result past the u64 range**, and
+  `fd_read` / `fd_write` at a cursor past the i64 range answer `inval`, as
+  wasmtime does.
+
+- **A positional file read or write past the i64 offset range answers
+  `invalid`**: WASI 0.1 `fd_pread` / `fd_pwrite`, 0.2 `descriptor.read` /
+  `write`, and the 0.2 / 0.3 file via-streams. It failed as an I/O error.
+
+- **A size or address the WASI host derives from a guest's values is
+  checked.** When it does not fit in u32 the call traps as the guest's memory
+  access (`OutOfBoundsStore`); before, the host process stopped.
+  [GHSA-wf5j-gpc8-4xvg](https://github.com/zwasm/zwasm/security/advisories/GHSA-wf5j-gpc8-4xvg).
+
+- **More host arithmetic on a guest's values is checked.** A WASI 0.1 gather
+  or scatter stops short before an iovec that would take its u32 total past
+  the range, a `stream.read` / `stream.write` of more than 2^28 − 1 elements
+  traps as the spec says, a component-graph list param whose byte size passes
+  u32 traps as its memory access, and a WASI 0.1 call sees only the first
+  4 GiB of a 64-bit memory, the part its pointers address.
+
 ### Documentation
 
 - `zwasm.h` and the C / CLI references say what the engine does: which
@@ -364,6 +583,9 @@ SemVer compatibility guarantees start at the first stable `v2.0.0` tag.
   The Zig API reference states which part of the package SemVer covers — the
   facade — and that the internal namespaces the package root also exports
   (`ir`, `runtime`, …) may change in any release.
+- `docs/threat_model.md` names whom zwasm trusts, its trust boundaries, what
+  counts as a vulnerability and how mature the runtime is; `SECURITY.md` points
+  to it and names a second maintainer to mention.
 
 ### Known limitations
 

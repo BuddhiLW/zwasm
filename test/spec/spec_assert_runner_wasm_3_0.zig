@@ -471,7 +471,7 @@ const JitFailLog = struct {
     fn record(self: *JitFailLog, proposal: []const u8, manifest: []const u8, func: []const u8) !void {
         // The manifest name is borrowed from a directory iterator whose
         // buffer is reused, so the key is copied rather than referenced.
-        const key = try std.fmt.allocPrint(self.gpa, "{s}/{s}/{s}", .{ proposal, manifest, func });
+        const key = try self.gpa.print("{s}/{s}/{s}", .{ proposal, manifest, func });
         errdefer self.gpa.free(key);
         try self.keys.append(self.gpa, key);
     }
@@ -645,7 +645,7 @@ const LvLog = struct {
     fn record(self: *LvLog, proposal: []const u8, manifest: []const u8, module_path: []const u8, n: u32) !void {
         // The manifest name is borrowed from a directory iterator whose
         // buffer is reused, so the key is copied rather than referenced.
-        const key = try std.fmt.allocPrint(self.gpa, "{s}/{s}/{s}", .{ proposal, manifest, module_path });
+        const key = try self.gpa.print("{s}/{s}/{s}", .{ proposal, manifest, module_path });
         errdefer self.gpa.free(key);
         // A manifest that names the same module twice compiles it twice;
         // the row counts the module, so the second compile adds to it.
@@ -833,7 +833,7 @@ pub fn main(init: std.process.Init) !void {
             if (entry.kind != .directory) continue;
             if (std.mem.eql(u8, entry.name, "raw")) continue;
 
-            const manifest_path = try std.fmt.allocPrint(gpa, "{s}/manifest.txt", .{entry.name});
+            const manifest_path = try gpa.print("{s}/manifest.txt", .{entry.name});
             defer gpa.free(manifest_path);
 
             // ADR-0210 — the identity is invariant under "drop a whole
@@ -1074,7 +1074,7 @@ pub fn main(init: std.process.Init) !void {
                             if (inst_ptr.handle.runtime) |rt| {
                                 for (inst_ptr.handle.exports_storage) |exp| {
                                     if (exp.kind == .table) {
-                                        cur_linker.defineTable("spectest", "table", rt.tables[exp.idx]) catch {};
+                                        cur_linker.defineTableInstance("spectest", "table", &rt.tables[exp.idx]) catch {};
                                     }
                                 }
                             }
@@ -1369,7 +1369,7 @@ pub fn main(init: std.process.Init) !void {
                                     // imports + their elem writes share it.
                                     if (inst_rt) |rt| {
                                         if (exp.idx < rt.tables.len) {
-                                            cur_linker.defineTable(d.func_name, exp.name, rt.tables[exp.idx]) catch {};
+                                            cur_linker.defineTableInstance(d.func_name, exp.name, &rt.tables[exp.idx]) catch {};
                                         }
                                     }
                                 },

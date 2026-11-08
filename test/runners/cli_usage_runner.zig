@@ -3,9 +3,16 @@
 //! precede the module path, so an unknown one is a usage error (exit 2) — not
 //! a module path that cannot be read (exit 1) — and `--` ends them. Anything
 //! after the path is the guest's argv, even when it spells a known option.
+//! And which engine runs a SIMD module, said where the run fails (#597).
+//! `--timeout` fires while the guest sleeps in `poll_oneoff` (#598).
+//! An f32 param with three results is refused by the JIT, not misread (#618).
+//! A component reaches the host's network only with `--allow-network`.
 //!
 //! Usage: `zig build test-cli-usage` /
-//!        `zwasm-cli-usage <zwasm-cli> <module.wasm> <argv_echo.wasm>`
+//!        `zwasm-cli-usage <zwasm-cli> <module.wasm> <argv_echo.wasm>
+//!         <simd_op.wasm> <simd_jit_decline.wasm> <select_v128_spilled_val2.wasm>
+//!         <poll_sleep.wasm> <f32_param_three_results.wasm>
+//!         <wasi_p2_tcp_rust.wasm>`
 
 const std = @import("std");
 const spawned_cli = @import("spawned_cli");
@@ -31,10 +38,19 @@ const Row = struct {
     stderr: Match = .any,
 };
 
-/// Stand-ins for the two module paths: a `_start` that does nothing, and one
-/// that echoes argv[1..] a line each.
+/// Stand-ins for the module paths, in argument order: a `_start` that does
+/// nothing, one that echoes argv[1..] a line each, one SIMD op, a SIMD module
+/// the JIT declines, #596's select, a 5 s sleep in `poll_oneoff`, #618's
+/// `(f32) -> (i32 i32 i32)`, and a Rust wasip2 TCP client.
 const M = "<module>";
 const E = "<argv_echo>";
+const S = "<simd_op>";
+const D = "<simd_jit_decline>";
+const V = "<select_spill>";
+const P = "<poll_sleep>";
+const F = "<f32_three>";
+const T = "<tcp_client>";
+const placeholders = [_][]const u8{ M, E, S, D, V, P, F, T };
 
 const rows = [_]Row{
     .{ .args = &.{ "run", "--bogus", M }, .exit = 2, .stderr = .{ .has = "unknown option '--bogus'" } },
@@ -45,6 +61,18 @@ const rows = [_]Row{
     .{ .args = &.{ "run", "--", M }, .exit = 0 },
     .{ .args = &.{ "run", E, "--engine", "jit" }, .exit = 0, .stdout = .{ .is = "--engine\njit\n" }, .stderr = .{ .is = "" } },
     .{ .args = &.{"--help"}, .exit = 0, .stdout = .{ .has = "run [options]" } },
+    .{ .args = &.{ "run", "--engine", "interp", S }, .exit = 1, .stderr = .{ .has = "the interpreter does not execute `v128.const`" } },
+    .{ .args = &.{ "run", D }, .exit = 1, .stderr = .{ .has = "`return_call` with a 3-result callee\nthe interpreter does not execute `v128.const`" } },
+    .{ .args = &.{ "run", "--invoke", "test", V }, .exit = 0, .stdout = .{ .is = "63\n" } },
+    .{ .args = &.{ "run", "--timeout", "500", "--engine", "interp", P }, .exit = 1, .stderr = .{ .has = "interrupted" } },
+    .{ .args = &.{ "run", "--timeout", "500", "--engine", "jit", P }, .exit = 1, .stderr = .{ .has = "interrupted" } },
+    .{ .args = &.{ "run", "--engine", "interp", "--invoke", "f=2.5", F }, .exit = 0, .stdout = .{ .is = "7\n250\n2500\n" } },
+    .{ .args = &.{ "run", "--engine", "jit", "--invoke", "f=2.5", F }, .exit = 1, .stderr = .{ .has = "unsupported entry signature" } },
+    .{ .args = &.{ "run", "--invoke", "f=2.5", F }, .exit = 1, .stderr = .{ .has = "unsupported" } },
+    // Nothing listens on loopback port 1, so a granted connect is refused by
+    // the peer; a listener row would hang on accept once the gate broke.
+    .{ .args = &.{ "run", T, "1" }, .exit = 1, .stderr = .{ .has = "connect failed: Os { code: 2, kind: PermissionDenied" } },
+    .{ .args = &.{ "run", "--allow-network", T, "1" }, .exit = 1, .stderr = .{ .has = "connect failed: Os { code: 14, kind: ConnectionRefused" } },
 };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -54,8 +82,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer arg_it.deinit();
     _ = arg_it.next().?;
     const cli = arg_it.next() orelse return error.MissingCliPath;
-    const module = arg_it.next() orelse return error.MissingModulePath;
-    const argv_echo = arg_it.next() orelse return error.MissingArgvEchoPath;
+    var paths: [placeholders.len][]const u8 = undefined;
+    for (&paths) |*p| p.* = arg_it.next() orelse return error.MissingModulePath;
     try spawned_cli.assertRunnerBuildMode(gpa, io, cli);
 
     var failed: u32 = 0;
@@ -63,7 +91,12 @@ pub fn main(init: std.process.Init) !u8 {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(gpa);
         try argv.append(gpa, cli);
-        for (row.args) |a| try argv.append(gpa, if (std.mem.eql(u8, a, M)) module else if (std.mem.eql(u8, a, E)) argv_echo else a);
+        for (row.args) |a| {
+            const path = for (placeholders, paths) |ph, p| {
+                if (std.mem.eql(u8, a, ph)) break p;
+            } else a;
+            try argv.append(gpa, path);
+        }
 
         const result = try std.process.run(gpa, io, .{ .argv = argv.items });
         defer gpa.free(result.stdout);

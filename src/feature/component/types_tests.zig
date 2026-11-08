@@ -7,6 +7,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const decode = @import("decode.zig");
 const canon = @import("canon.zig");
+const validate = @import("validate.zig");
 
 const Error = types.Error;
 const ExternDesc = types.ExternDesc;
@@ -145,13 +146,33 @@ test "export with no externdesc (optional absent)" {
     try testing.expectEqual(@as(?ExternDesc, null), info.exports.items[0].desc);
 }
 
-test "import name 0x02 prefix carries a dropped version suffix" {
-    // import 0x02 "p:i" version "1.0" (func type 0)
-    const import_body = [_]u8{ 0x01, 0x02, 0x03, 'p', ':', 'i', 0x03, '1', '.', '0', 0x01, 0x00 };
-    const bytes = comptime buildComponent(&.{.{ 10, &import_body }});
-    var info = try decodeBoth(bytes);
-    defer info.deinit();
-    try testing.expectEqualStrings("p:i", info.imports.items[0].name);
+test "import name 0x02 attributes are consumed and dropped, one or several" {
+    // Each import: 0x02 "p:i" vec(attribute) (func type 0), then a plain
+    // import "q" (func type 1) — the second decodes only if the attribute
+    // bytes were consumed exactly.
+    const tail = [_]u8{ 0x01, 0x00, 0x00, 0x01, 'q', 0x01, 0x01 };
+    const head = [_]u8{ 0x02, 0x02, 0x03, 'p', ':', 'i' };
+    const implements = [_]u8{ 0x00, 0x05, 'a', ':', 'b', '/', 'c' };
+    const version_suffix = [_]u8{ 0x01, 0x03, '1', '.', '0' };
+    const external_id = [_]u8{ 0x02, 0x02, 'i', 'd' };
+    const bodies = .{
+        head ++ [_]u8{0x01} ++ implements ++ tail,
+        head ++ [_]u8{0x01} ++ version_suffix ++ tail,
+        head ++ [_]u8{0x01} ++ external_id ++ tail,
+        head ++ [_]u8{0x02} ++ implements ++ version_suffix ++ tail,
+    };
+    inline for (bodies) |body| {
+        var info = try decodeBoth(comptime buildComponent(&.{.{ 10, &body }}));
+        defer info.deinit();
+        try testing.expectEqualStrings("p:i", info.imports.items[0].name);
+        try testing.expectEqual(@as(u32, 0), info.imports.items[0].desc.func);
+        try testing.expectEqualStrings("q", info.imports.items[1].name);
+        try testing.expectEqual(@as(u32, 1), info.imports.items[1].desc.func);
+    }
+
+    // An attribute kind outside 0x00..0x02 is malformed.
+    const bad = head ++ [_]u8{ 0x01, 0x03, 0x01, 'x' } ++ tail;
+    try testing.expectError(Error.InvalidName, decodeBoth(comptime buildComponent(&.{.{ 10, &bad }})));
 }
 
 test "core-module externdesc (0x00 0x11)" {
@@ -258,6 +279,17 @@ test "stream<T>/future<T> decode (0x66/0x65) with optional payload" {
     try testing.expectEqual(PrimValType.u32, info.deftypes.items[0].stream.payload.?.primitive);
     try testing.expect(info.deftypes.items[1].stream.payload == null);
     try testing.expectEqual(@as(u32, 0), info.deftypes.items[2].future.payload.?.type_index);
+}
+
+test "map<K, V> decode (0x63 key value)" {
+    // type[0] map<string, u32>; type[1] map<u32, type 0>.
+    const body = [_]u8{ 0x02, 0x63, 0x73, 0x79, 0x63, 0x79, 0x00 };
+    var info = try decodeBoth(comptime buildComponent(&.{.{ 7, &body }}));
+    defer info.deinit();
+    try testing.expectEqual(PrimValType.string, info.deftypes.items[0].map.key.primitive);
+    try testing.expectEqual(PrimValType.u32, info.deftypes.items[0].map.value.primitive);
+    try testing.expectEqual(PrimValType.u32, info.deftypes.items[1].map.key.primitive);
+    try testing.expectEqual(@as(u32, 0), info.deftypes.items[1].map.value.type_index);
 }
 
 test "canon section: canon lift with opts (utf8 + memory 0 + realloc 1)" {
@@ -650,4 +682,164 @@ test "parseWasiGen: a 0.3.x patch release is p3, whatever its patch number" {
     try testing.expectEqual(types.WasiGen.p3, types.parseWasiGen("0.3.0-rc-2026-03-15"));
     try testing.expectEqual(types.WasiGen.p2, types.parseWasiGen("0.2.6"));
     try testing.expectEqual(types.WasiGen.any, types.parseWasiGen("0.30.0"));
+}
+
+/// Append `v` as unsigned LEB128.
+fn putUleb(out: *std.ArrayList(u8), gpa: std.mem.Allocator, v: u32) !void {
+    var x = v;
+    while (true) {
+        const b: u8 = @intCast(x & 0x7f);
+        x >>= 7;
+        if (x == 0) return out.append(gpa, b);
+        try out.append(gpa, b | 0x80);
+    }
+}
+
+/// Append one section: id, size, body.
+fn putSection(out: *std.ArrayList(u8), gpa: std.mem.Allocator, id: u8, body: []const u8) !void {
+    try out.append(gpa, id);
+    try putUleb(out, gpa, @intCast(body.len));
+    try out.appendSlice(gpa, body);
+}
+
+/// Append `v` (non-negative) as signed LEB128, as a type index is encoded.
+fn putSleb(out: *std.ArrayList(u8), gpa: std.mem.Allocator, v: u32) !void {
+    var x = v;
+    while (true) {
+        const b: u8 = @intCast(x & 0x7f);
+        x >>= 7;
+        if (x == 0 and b & 0x40 == 0) return out.append(gpa, b);
+        try out.append(gpa, b | 0x80);
+    }
+}
+
+/// A type section whose last entry has nesting depth `depth`, counted as
+/// wasmparser counts it (a primitive is 1, a compound type is 1 + its
+/// deepest component): `type[0] = list<u32>`, `type[i] = list<type[i-1]>`,
+/// then `stream<type[k]>` with `k = depth - 3`.
+fn typeIndexChain(gpa: std.mem.Allocator, depth: u32) !std.ArrayList(u8) {
+    std.debug.assert(depth >= 3);
+    const k = depth - 3;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try putUleb(&body, gpa, k + 2);
+    try body.appendSlice(gpa, &.{ 0x70, 0x79 });
+    var i: u32 = 1;
+    while (i <= k + 1) : (i += 1) {
+        try body.append(gpa, if (i <= k) 0x70 else 0x66);
+        if (i > k) try body.append(gpa, 0x01);
+        try putSleb(&body, gpa, i - 1);
+    }
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(gpa);
+    try bytes.appendSlice(gpa, &.{ 0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00 });
+    try putSection(&bytes, gpa, 7, body.items);
+    return bytes;
+}
+
+/// A type section holding one component type that nests `levels`
+/// component types, the outermost included.
+fn declScopeChain(gpa: std.mem.Allocator, levels: u32) !std.ArrayList(u8) {
+    var ty: std.ArrayList(u8) = .empty;
+    defer ty.deinit(gpa);
+    var i: u32 = 0;
+    while (i < levels - 1) : (i += 1) try ty.appendSlice(gpa, &.{ 0x41, 0x01, 0x01 });
+    try ty.appendSlice(gpa, &.{ 0x41, 0x00 });
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try body.append(gpa, 0x01);
+    try body.appendSlice(gpa, ty.items);
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(gpa);
+    try bytes.appendSlice(gpa, &.{ 0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00 });
+    try putSection(&bytes, gpa, 7, body.items);
+    return bytes;
+}
+
+test "type depth through the index space: max_type_depth is accepted, one more is refused" {
+    const gpa = testing.allocator;
+    var at_cap = try typeIndexChain(gpa, types.max_type_depth);
+    defer at_cap.deinit(gpa);
+    var info = try decodeBoth(at_cap.items);
+    defer info.deinit();
+    try validate.validate(&info);
+
+    var past_cap = try typeIndexChain(gpa, types.max_type_depth + 1);
+    defer past_cap.deinit(gpa);
+    try testing.expectError(Error.TypeNestingTooDeep, decodeBoth(past_cap.items));
+}
+
+test "type depth through declaration scopes: max_type_depth levels are accepted, one more is refused" {
+    const gpa = testing.allocator;
+    var at_cap = try declScopeChain(gpa, types.max_type_depth);
+    defer at_cap.deinit(gpa);
+    var info = try decodeBoth(at_cap.items);
+    defer info.deinit();
+    try validate.validate(&info);
+
+    var past_cap = try declScopeChain(gpa, types.max_type_depth + 1);
+    defer past_cap.deinit(gpa);
+    try testing.expectError(Error.TypeNestingTooDeep, decodeBoth(past_cap.items));
+}
+
+test "a func re-export chain resolves without recursing per link" {
+    const gpa = testing.allocator;
+    const n: u32 = 300_000;
+    // export "f<i>" (func i): func 0 is the lift, export i mints func i + 1.
+    var exports: std.ArrayList(u8) = .empty;
+    defer exports.deinit(gpa);
+    try putUleb(&exports, gpa, n);
+    var name_buf: [16]u8 = undefined;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const name = try std.mem.print(&name_buf, "f{d}", .{i});
+        try exports.append(gpa, 0x00);
+        try putUleb(&exports, gpa, @intCast(name.len));
+        try exports.appendSlice(gpa, name);
+        try exports.append(gpa, 0x01); // sort func
+        try putUleb(&exports, gpa, i);
+        try exports.append(gpa, 0x00); // no externdesc
+    }
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(gpa);
+    try bytes.appendSlice(gpa, &.{ 0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00 });
+    try putSection(&bytes, gpa, 7, &.{ 0x01, 0x40, 0x00, 0x01, 0x00 }); // type[0] = (func)
+    try putSection(&bytes, gpa, 8, &.{ 0x01, 0x00, 0x00, 0x00, 0x00, 0x00 }); // lift core func 0, type 0
+    try putSection(&bytes, gpa, 11, exports.items);
+
+    var info = try decodeBoth(bytes.items);
+    defer info.deinit();
+    const ft = info.resolveFuncType(try std.mem.print(&name_buf, "f{d}", .{n - 1})).?;
+    try testing.expectEqual(@as(usize, 0), ft.params.len);
+}
+
+/// A component holding `n` components, each nested in the one before.
+fn nestedComponents(gpa: std.mem.Allocator, n: u32) !std.ArrayList(u8) {
+    const preamble = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00 };
+    var cur: std.ArrayList(u8) = .empty;
+    errdefer cur.deinit(gpa);
+    try cur.appendSlice(gpa, &preamble);
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        var next: std.ArrayList(u8) = .empty;
+        errdefer next.deinit(gpa);
+        try next.appendSlice(gpa, &preamble);
+        try putSection(&next, gpa, 4, cur.items);
+        cur.deinit(gpa);
+        cur = next;
+    }
+    return cur;
+}
+
+test "nested components: max_nested_components are accepted, one more is refused" {
+    const gpa = testing.allocator;
+    var at_cap = try nestedComponents(gpa, types.max_nested_components);
+    defer at_cap.deinit(gpa);
+    var info = try decodeBoth(at_cap.items);
+    defer info.deinit();
+    try validate.validate(&info);
+
+    var past_cap = try nestedComponents(gpa, types.max_nested_components + 1);
+    defer past_cap.deinit(gpa);
+    try testing.expectError(Error.TooManyNestedComponents, decodeBoth(past_cap.items));
 }

@@ -29,6 +29,7 @@ const diagnostic = @import("../diagnostic/diagnostic.zig");
 const decline_note = @import("../engine/codegen/shared/decline_note.zig");
 const wasi_host = @import("../wasi/host.zig");
 const invoke_args_mod = @import("invoke_args.zig");
+const component_entry = @import("component_entry.zig");
 const export_lookup = @import("../engine/export_lookup.zig");
 const dbg = @import("../support/dbg.zig");
 const call_profile = @import("../support/call_profile.zig");
@@ -293,7 +294,7 @@ pub fn runWasmJitCaptured(
         // v128 is outside the C-ABI `Val` set — render the 16 bytes as a
         // little-endian u128 decimal (matches wasmtime's `--invoke` output).
         const bare = if (sr == .v128)
-            try std.fmt.bufPrint(b[0 .. b.len - 1], "{d}", .{@as(u128, @bitCast(sr.v128))})
+            try std.mem.print(b[0 .. b.len - 1], "{d}", .{@as(u128, @bitCast(sr.v128))})
         else
             try invoke_args_mod.formatScalar(b[0 .. b.len - 1], scalarToVal(sr));
         b[bare.len] = '\n';
@@ -309,11 +310,31 @@ pub fn runWasmJitCaptured(
 /// `unsupported` mirroring the one #431 added to `trap_surface.TrapKind` — that
 /// is a migration of all of this file's sites, not one.
 fn reportDecline(note: decline_note.Note) void {
-    const tail = "; the default engine runs this module on the interpreter";
+    setDeclineDiag(note, "; the default engine tries the interpreter");
+}
+
+fn setDeclineDiag(note: decline_note.Note, tail: []const u8) void {
     switch (note.reason) {
-        .overflow_words => |n| diagnostic.setDiag(.instantiate, .binding_error, .unknown, "the JIT does not compile `{s}` with {d} overflow argument word{s}" ++ tail, .{ note.op, n, if (n == 1) "" else "s" }),
-        .simd_args => |n| diagnostic.setDiag(.instantiate, .binding_error, .unknown, "the JIT does not compile `{s}` with {d} floating-point or vector arguments — more than the register bank carries" ++ tail, .{ note.op, n }),
-        .memory_class_results => |n| diagnostic.setDiag(.instantiate, .binding_error, .unknown, "the JIT does not compile `{s}` with a {d}-result callee" ++ tail, .{ note.op, n }),
+        .overflow_words => |n| diagnostic.setDiag(.instantiate, .binding_error, .unknown, "the JIT does not compile `{s}` with {d} overflow argument word{s}{s}", .{ note.op, n, if (n == 1) "" else "s", tail }),
+        .simd_args => |n| diagnostic.setDiag(.instantiate, .binding_error, .unknown, "the JIT does not compile `{s}` with {d} floating-point or vector arguments — more than the register bank carries{s}", .{ note.op, n, tail }),
+        .memory_class_results => |n| diagnostic.setDiag(.instantiate, .binding_error, .unknown, "the JIT does not compile `{s}` with a {d}-result callee{s}", .{ note.op, n, tail }),
+    }
+}
+
+/// #597 — `.auto` reaches the interpreter only after the JIT declined, and a
+/// JIT `Final` arrives as a trap, so a reason in the slot after a trap-less
+/// failure is the interpreter's. Both engines refused: one line each, the
+/// decline first.
+fn reportAutoRefusal() void {
+    const refusal = diagnostic.lastDiagnostic().?.message();
+    var tail_buf: [diagnostic.message_buf_size + 1]u8 = undefined;
+    tail_buf[0] = '\n';
+    @memcpy(tail_buf[1..][0..refusal.len], refusal);
+    const tail = tail_buf[0 .. refusal.len + 1];
+    if (decline_note.take()) |note| {
+        setDeclineDiag(note, tail);
+    } else {
+        diagnostic.setDiag(.instantiate, .binding_error, .unknown, "the JIT declined this module{s}", .{tail});
     }
 }
 
@@ -425,24 +446,30 @@ fn scalarToVal(r: @import("../engine/runner.zig").ScalarResult) wasm_c_api.Val {
     };
 }
 
+pub const ComponentInvoke = component_entry.Invoke;
+
 /// `zwasm run <component.wasm>` (CM campaign D1-2 / D-306): run a WASI Preview 2
 /// **component** from the CLI. Routes a component-layer module (preamble version
-/// `0x0d`, layer 1) to the component host (`api/component.zig runWasiP2Main`),
-/// wiring real stdout via the WASI host (`io` set, no capture buffer → the
-/// trampolines' `fd.writeSlice` routes fd 1 to the process stdout). Returns the
-/// guest exit code (0 on clean run). SCOPE: the `wasi:cli/run` stdio subset (the
-/// general P2 host is D-306).
+/// `0x0d`, layer 1) to the component host, wiring real stdout via the WASI host
+/// (`io` set, no capture buffer → the trampolines' `fd.writeSlice` routes fd 1
+/// to the process stdout). The entry is `wasi:cli/run`, or `invoke` (#622,
+/// `component_entry.zig`). Returns the guest exit code (0 on clean run); a
+/// refusal returns `error.ComponentRefused` with its stderr line in `refusal`.
 pub fn runComponentWasi(
     alloc: std.mem.Allocator,
     io: std.Io,
     bytes: []const u8,
+    path: []const u8,
+    invoke: ?ComponentInvoke,
     argv: []const []const u8,
     preopens: []const PreopenDir,
     env_keys: []const []const u8,
     env_vals: []const []const u8,
+    allow_network: bool,
     stdin: StdinSource,
+    refusal: *std.ArrayList(u8),
 ) !u8 {
-    return runComponentCaptured(alloc, io, bytes, argv, preopens, env_keys, env_vals, stdin, null);
+    return runComponentCaptured(alloc, io, bytes, path, invoke, argv, preopens, env_keys, env_vals, allow_network, stdin, null, refusal);
 }
 
 /// `runComponentWasi` with an optional stdout capture buffer (tests assert on
@@ -451,12 +478,16 @@ pub fn runComponentCaptured(
     alloc: std.mem.Allocator,
     io: std.Io,
     bytes: []const u8,
+    path: []const u8,
+    invoke: ?ComponentInvoke,
     argv: []const []const u8,
     preopens: []const PreopenDir,
     env_keys: []const []const u8,
     env_vals: []const []const u8,
+    allow_network: bool,
     stdin: StdinSource,
     stdout_capture: ?*std.ArrayList(u8),
+    refusal: *std.ArrayList(u8),
 ) !u8 {
     const component = @import("../api/component.zig");
     const Engine = @import("../zwasm/engine.zig").Engine;
@@ -469,6 +500,7 @@ pub fn runComponentCaptured(
     if (stdout_capture) |b| host.stdout_buffer = b;
     if (argv.len > 0) try host.setArgs(argv);
     if (env_keys.len > 0) try host.setEnvs(env_keys, env_vals); // D-295 P0: --env KEY=VAL
+    host.allow_network = allow_network;
     stdin.applyTo(&host); // the guest's fd 0 source
     // `--dir` preopens feed the P2 host: `get-directories` enumerates them and
     // the descriptor `*-at` methods resolve against their fds.
@@ -478,12 +510,23 @@ pub fn runComponentCaptured(
     // REQ-4 — the component CLI path uses the default budget for now; wiring
     // the `--fuel`/`--max-memory` flags into `runComponentCaptured` is a
     // separate CLI enhancement (the API-level budget is the cw requirement).
-    // Unified runner (D-335 Unit F): async-lifted components run through the P3
-    // callback loop, sync ones through `wasi:cli/run` — auto-dispatched.
-    component.runWasiMain(&eng, alloc, bytes, &host, .{}) catch |err| {
+    // Unified runner (D-335 Unit F): `runWasiMain` selects the entry by name
+    // and runs it through the P3 callback loop or the sync call, per its lift.
+    var result_text: std.ArrayList(u8) = .empty;
+    defer result_text.deinit(alloc);
+    const ran = if (invoke) |call|
+        component_entry.invoke(alloc, &eng, bytes, &host, path, call, &result_text, refusal)
+    else
+        component.runWasiMain(&eng, alloc, bytes, &host, .{});
+    ran catch |err| {
         if (host.exit_code) |code| return @intCast(@min(code, std.math.maxInt(u8)));
+        if (err == error.NoRunExport) {
+            try component_entry.writeNoRunRefusal(alloc, bytes, path, refusal);
+            return error.ComponentRefused;
+        }
         return err;
     };
+    try writeResultText(io, stdout_capture, alloc, result_text.items);
     if (host.exit_code) |code| return @intCast(@min(code, std.math.maxInt(u8)));
     return 0;
 }
@@ -629,6 +672,7 @@ pub fn runCapturedPrecompiled(
     // Per ADR-0016 phase 1: clear any stale diagnostic from a
     // previous call before populating a fresh one on failure.
     diagnostic.clearDiag();
+    decline_note.clear();
 
     const engine = wasm_c_api.wasm_engine_new() orelse {
         diagnostic.setDiag(.instantiate, .engine_alloc_failed, .unknown, "engine allocation failed", .{});
@@ -712,7 +756,13 @@ pub fn runCapturedPrecompiled(
                 diagnostic.setDiag(.instantiate, .instance_alloc_failed, .unknown, "wasi preopen dir '{s}' open failed: {s}", .{ cfg.pending_preopens.items[0].host_path, @errorName(err) });
                 return err;
             };
-            diagnostic.setDiag(.instantiate, .instance_alloc_failed, .unknown, "instantiation failed (no further detail in phase 1)", .{});
+            // A reason the setup recorded stands, as the interpreter's refusal
+            // of an op it does not execute does (#597).
+            if (diagnostic.lastDiagnostic() == null) {
+                diagnostic.setDiag(.instantiate, .instance_alloc_failed, .unknown, "instantiation failed (no further detail in phase 1)", .{});
+            } else if (limits.engine == .auto) {
+                reportAutoRefusal();
+            }
         }
         return error.InstanceAllocFailed;
     };
@@ -960,7 +1010,9 @@ test "runComponentWasi: a real WASI-P2 component runs from the CLI path + prints
     defer testing.allocator.free(bytes);
     var capture: std.ArrayList(u8) = .empty;
     defer capture.deinit(testing.allocator);
-    const code = try runComponentCaptured(testing.allocator, testing.io, bytes, &.{}, &.{}, &.{}, &.{}, .none, &capture);
+    var refusal: std.ArrayList(u8) = .empty;
+    defer refusal.deinit(testing.allocator);
+    const code = try runComponentCaptured(testing.allocator, testing.io, bytes, "test.wasm", null, &.{}, &.{}, &.{}, &.{}, false, .none, &capture, &refusal);
     try testing.expectEqual(@as(u8, 0), code);
     try testing.expectEqualStrings("hello\n", capture.items);
 }
@@ -972,9 +1024,63 @@ test "runComponentWasi: an ASYNC (WASI-0.3 P3) component runs from the CLI path 
     defer testing.allocator.free(bytes);
     var capture: std.ArrayList(u8) = .empty;
     defer capture.deinit(testing.allocator);
-    const code = try runComponentCaptured(testing.allocator, testing.io, bytes, &.{}, &.{}, &.{}, &.{}, .none, &capture);
-    try testing.expectEqual(@as(u8, 0), code);
+    var refusal: std.ArrayList(u8) = .empty;
+    defer refusal.deinit(testing.allocator);
+    const got = runComponentCaptured(testing.allocator, testing.io, bytes, "test.wasm", null, &.{}, &.{}, &.{}, &.{}, false, .none, &capture, &refusal);
+    if (comptime !@import("build_options").enable_wasi_p3) {
+        // ADR-0193 P3: a p2 build has no async driver for the async `run`.
+        try testing.expectError(error.AsyncEntryNeedsWasiP3, got);
+        return;
+    }
+    try testing.expectEqual(@as(u8, 0), try got);
     try testing.expectEqualStrings("hi\n", capture.items);
+}
+
+test "runComponentWasi: a sync wasi:cli/run runs, not an unrelated async export (#677)" {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(testing.io, "test/component/run_plus_async.wasm", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    var capture: std.ArrayList(u8) = .empty;
+    defer capture.deinit(testing.allocator);
+    var refusal: std.ArrayList(u8) = .empty;
+    defer refusal.deinit(testing.allocator);
+    const code = try runComponentCaptured(testing.allocator, testing.io, bytes, "test.wasm", null, &.{}, &.{}, &.{}, &.{}, false, .none, &capture, &refusal);
+    try testing.expectEqual(@as(u8, 0), code);
+}
+
+test "runComponentWasi: a top-level run: func() is the entry (#677)" {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(testing.io, "test/component/run_void.wasm", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    var capture: std.ArrayList(u8) = .empty;
+    defer capture.deinit(testing.allocator);
+    var refusal: std.ArrayList(u8) = .empty;
+    defer refusal.deinit(testing.allocator);
+    const code = try runComponentCaptured(testing.allocator, testing.io, bytes, "test.wasm", null, &.{}, &.{}, &.{}, &.{}, false, .none, &capture, &refusal);
+    try testing.expectEqual(@as(u8, 0), code);
+}
+
+test "runComponentWasi: a top-level run that takes a parameter is refused with the exports listed (#677)" {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(testing.io, "test/component/run_with_param.wasm", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    var capture: std.ArrayList(u8) = .empty;
+    defer capture.deinit(testing.allocator);
+    var refusal: std.ArrayList(u8) = .empty;
+    defer refusal.deinit(testing.allocator);
+    try testing.expectError(error.ComponentRefused, runComponentCaptured(testing.allocator, testing.io, bytes, "test.wasm", null, &.{}, &.{}, &.{}, &.{}, false, .none, &capture, &refusal));
+    try testing.expect(std.mem.find(u8, refusal.items, "its exports are: run: func(x: u32) -> u32") != null);
+}
+
+test "runComponentWasi: wasi:cli/run@0.3.0 runs over @0.2.0 (#677)" {
+    if (comptime !@import("build_options").enable_wasi_p3) return; // ADR-0193 P3: no async driver
+    // The official command's 0.3 `run` returns `err` (exit 1); its 0.2 `run`
+    // traps `Unreachable`.
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(testing.io, "test/component/wasip3_official/run-with-err.wasm", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    var capture: std.ArrayList(u8) = .empty;
+    defer capture.deinit(testing.allocator);
+    var refusal: std.ArrayList(u8) = .empty;
+    defer refusal.deinit(testing.allocator);
+    const code = try runComponentCaptured(testing.allocator, testing.io, bytes, "test.wasm", null, &.{}, &.{}, &.{}, &.{}, false, .none, &capture, &refusal);
+    try testing.expectEqual(@as(u8, 1), code);
 }
 
 test "runWasm: malformed wasm produces a parse-phase diagnostic with byte offset (F6)" {
@@ -1463,13 +1569,13 @@ test "runCwasmWasi: a WASI fd_write .cwasm writes 'hi\\n' to the captured stdout
     try testing.expectEqualStrings("hi\n", capture.items);
 }
 
-test "runWasmJit: SIMD _start runs via the JIT where the interp traps (ADR-0136 / D-244)" {
-    // Interpreter path: no SIMD execution → the `i32x4.add` dispatch slot is
-    // null → Trap.Unreachable, which the run path maps to a non-zero exit
-    // code (a trap is exit≠0, not a Zig error). D-496: force `.interp` — the
-    // post-flip default `.auto` would run SIMD on the JIT (this leg is the foil).
-    const interp_code = try runWasmCapturedOpts(testing.allocator, testing.io, &simd_start_wasm, &.{}, null, null, &.{}, &.{}, &.{}, null, .{ .engine = .interp });
-    try testing.expect(interp_code != 0);
+test "runWasmJit: SIMD _start runs via the JIT where the interp refuses it (ADR-0136 / D-244)" {
+    // Interpreter path: no SIMD execution → the `v128.const` dispatch slot is
+    // null, so instantiation refuses the module, naming the op (#597). D-496:
+    // force `.interp` — the post-flip default `.auto` would run SIMD on the JIT
+    // (this leg is the foil).
+    try testing.expectError(error.InstanceAllocFailed, runWasmCapturedOpts(testing.allocator, testing.io, &simd_start_wasm, &.{}, null, null, &.{}, &.{}, &.{}, null, .{ .engine = .interp }));
+    try testing.expectEqualStrings("the interpreter does not execute `v128.const`", diagnostic.lastDiagnostic().?.message());
 
     // JIT path: compiles + runs the SIMD `_start` to completion → 0.
     const jit_code = try runWasmJit(testing.allocator, testing.io, &simd_start_wasm, null, &.{}, &.{}, &.{}, &.{}, .{});
@@ -1844,10 +1950,12 @@ fn fdsLeftOverTenRuns(preopens: []const PreopenDir, expected: anyerror!u8) ![3]i
         for (0..10) |_| {
             var capture: std.ArrayList(u8) = .empty;
             defer capture.deinit(testing.allocator);
+            var refusal: std.ArrayList(u8) = .empty;
+            defer refusal.deinit(testing.allocator);
             const got = switch (runner_kind) {
                 .full => runWasmCapturedFull(testing.allocator, testing.io, &proc_exit_42_wasm, &.{}, null, null, .none, null, preopens, &.{}, &.{}, null, .{}),
                 .jit => runWasmJitCaptured(testing.allocator, testing.io, &proc_exit_42_wasm, null, &.{}, preopens, &.{}, &.{}, .{}, null, null, .none),
-                .component => runComponentCaptured(testing.allocator, testing.io, component_bytes, &.{}, preopens, &.{}, &.{}, .none, &capture),
+                .component => runComponentCaptured(testing.allocator, testing.io, component_bytes, "test.wasm", null, &.{}, preopens, &.{}, &.{}, false, .none, &capture, &refusal),
             };
             if (expected) |code| {
                 try testing.expectEqual(if (runner_kind == .component) 0 else code, try got);

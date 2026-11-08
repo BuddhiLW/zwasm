@@ -806,8 +806,9 @@ fn runWasiLenientArgsCore(
     // thunk. Single scalar/void result fills `result_out`; a MULTI result (≥2,
     // when `multi_out` is provided and holds at least the result arity) fills
     // `multi_out[0..arity]` (TypedResult[], same decode as `invokeMulti`). Only
-    // shapes for which `wrapper_thunk.emit` produced a thunk (hasThunk) qualify;
-    // FP/v128/>N-param shapes have no thunk → fall through to the reject below.
+    // shapes for which `wrapper_thunk.emit` produced a thunk (hasThunk) qualify
+    // — the set differs per ABI and lives there; the rest fall through to the
+    // reject below.
     // `args` are the pre-packed u64 carriers.
     const can_multi = sig.results.len >= 2 and multi_out != null and multi_out.?.len >= sig.results.len;
     if (sig.params.len == args.len and
@@ -816,7 +817,7 @@ fn runWasiLenientArgsCore(
     {
         var abuf: [16]u64 = undefined;
         for (args, 0..) |a, j| abuf[j] = a;
-        var rbuf: [16]u64 = [_]u64{0} ** 16;
+        var rbuf: [16]u64 = @splat(0);
         const fnp = compiled.module.entry_buf(idx, buffer_write.BufferWriteFn);
         buffer_write.invokeBufferWrite(&owned.rt, fnp, &abuf, &rbuf) catch |err| {
             if (err == Error.Trap) {
@@ -1589,8 +1590,8 @@ pub const JitInstance = struct {
         }
         // D-477: any remaining multi-arg shape (3-arg non-(i32³), 4+ args)
         // routes through the generalized buffer-write thunk when one exists
-        // (exported GPR-class, ≤7 params). FP/v128/>7-param shapes have no
-        // thunk and stay UnsupportedEntrySignature until their later slice.
+        // (FP params included; the per-ABI param cap is in `wrapper_thunk`).
+        // v128 shapes have no thunk and stay UnsupportedEntrySignature.
         return self.invokeViaBufferSingle(func_idx, sig, args, run_as_void);
     }
 

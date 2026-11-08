@@ -7,9 +7,8 @@
 //! empty / null value disables every module.
 //!
 //! Compile-stripped in `ReleaseFast` / `ReleaseSmall` via a
-//! `builtin.mode` guard — release builds emit zero code for the
-//! call site (the comptime branch + `@compileLog`-free body
-//! collapses).
+//! `builtin.mode` guard. ReleaseSafe (the mode `release.yml` ships)
+//! keeps the whitelist check.
 //!
 //! ## Initialization (D-009 refactor)
 //!
@@ -110,9 +109,8 @@ pub fn initFromEnv(value: ?[]const u8) void {
 }
 
 fn enabled(comptime mod: []const u8) bool {
-    // Release builds skip the env read entirely — call sites
-    // collapse to nothing.
-    if (builtin.mode == .ReleaseFast or builtin.mode == .ReleaseSmall) {
+    // ReleaseFast / ReleaseSmall skip the whitelist entirely.
+    if (builtin.mode == .fast or builtin.mode == .small) {
         return false;
     }
     // Pre-init: dbg is a no-op (= release-equivalent default).
@@ -139,9 +137,11 @@ fn enabled(comptime mod: []const u8) bool {
 }
 
 /// Print `fmt`-formatted output to stderr if `mod` is enabled by
-/// `ZWASM_DEBUG`. Comptime no-op in release builds.
+/// `ZWASM_DEBUG`. Comptime no-op in ReleaseFast / ReleaseSmall. The
+/// call site evaluates `args` in every mode, so an expensive argument
+/// goes behind `if (on(mod))` (#649).
 pub fn print(comptime mod: []const u8, comptime fmt: []const u8, args: anytype) void {
-    if (builtin.mode == .ReleaseFast or builtin.mode == .ReleaseSmall) {
+    if (builtin.mode == .fast or builtin.mode == .small) {
         return;
     }
     if (!enabled(mod)) return;
@@ -151,8 +151,10 @@ pub fn print(comptime mod: []const u8, comptime fmt: []const u8, args: anytype) 
 /// Whether `mod` is enabled by `ZWASM_DEBUG` — the gate predicate
 /// behind `print`, exposed for call sites that must emit
 /// variable-shaped output (e.g. a hex byte dump) that a comptime
-/// `fmt` cannot express. Comptime no-op in release builds, same as
-/// `print`. Pair with `std.debug.print` inside the guarded block.
+/// `fmt` cannot express, or that must not compute its arguments
+/// unless the channel is on. Comptime-false in ReleaseFast /
+/// ReleaseSmall, same as `print`. Pair with `std.debug.print` inside
+/// the guarded block.
 pub fn on(comptime mod: []const u8) bool {
     return enabled(mod);
 }
@@ -161,9 +163,9 @@ pub fn on(comptime mod: []const u8) bool {
 /// predicate (ADR-0203 stage 2 / D-519): dbg-instrumented codegen (e.g.
 /// `jit.callcount`, `global.trace`) bakes this process's diagnostic-counter
 /// addresses into emitted code, which must never be serialized into a
-/// `.cwasm`. Comptime-false in release builds like `on`.
+/// `.cwasm`. Comptime-false in ReleaseFast / ReleaseSmall, like `on`.
 pub fn anyActive() bool {
-    if (builtin.mode == .ReleaseFast or builtin.mode == .ReleaseSmall) {
+    if (builtin.mode == .fast or builtin.mode == .small) {
         return false;
     }
     if (!whitelist_initialised) return false;

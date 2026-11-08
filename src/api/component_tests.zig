@@ -6,7 +6,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const testing = std.testing;
-const Allocator = std.mem.Allocator;
 
 const component = @import("component.zig");
 const cwasi = @import("component_wasi_p2.zig");
@@ -15,6 +14,7 @@ const ctypes = @import("../feature/component/types.zig");
 const decode = @import("../feature/component/decode.zig");
 const cvalidate = @import("../feature/component/validate.zig");
 const diagnostic = @import("../diagnostic/diagnostic.zig");
+const p2_sockets = @import("../wasi/p2_sockets.zig");
 const wasi_host = @import("../wasi/host.zig");
 const wasi_fd = @import("../wasi/fd.zig");
 const wasi_p1 = @import("../wasi/preview1.zig");
@@ -22,7 +22,6 @@ const PrimValType = ctypes.PrimValType;
 const WasiP2Ctx = cwasi.WasiP2Ctx;
 const Engine = @import("../zwasm/engine.zig").Engine;
 const Module = @import("../zwasm/module.zig").Module;
-const Instance = @import("../zwasm/instance.zig").Instance;
 const Value = @import("../zwasm.zig").Value;
 const Caller = @import("../zwasm/caller.zig").Caller;
 
@@ -32,16 +31,10 @@ const instantiateGraph = component.instantiateGraph;
 const invokeTypedBuilt = component.invokeTypedBuilt;
 const runWasiP2Main = component.runWasiP2Main;
 const buildWasiP2Component = component.buildWasiP2Component;
-const BuiltComponent = component.BuiltComponent;
-const ComponentInstance = component.ComponentInstance;
-const ComponentGraph = component.ComponentGraph;
 const ComponentValue = component.ComponentValue;
 const WitType = component.WitType;
-const FuncSig = component.FuncSig;
 const InvokeTypedError = component.InvokeTypedError;
 const Error = component.Error;
-const MAX_FLAT_PARAMS = component.MAX_FLAT_PARAMS;
-const Opened = component.Opened;
 const open = component.open;
 const componentNeedsWasi = component.componentNeedsWasi;
 
@@ -74,6 +67,93 @@ test "REQ-1 (cw CM-API): open auto-selects single path for a pure component + un
     const out = (try opened.invokeTyped("greet", &.{.{ .string = "zwasm" }}, testing.allocator)).?;
     defer out.deinit(testing.allocator);
     try testing.expectEqualStrings("Hello, zwasm!", out.string);
+}
+
+test "#611: a map<string, u32> param lowers as list<tuple<string, u32>> and its WitType stays a map" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, "test/component/map_sum_component.wasm", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+
+    var eng = try Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var host = try wasi_host.Host.init(testing.allocator);
+    defer host.deinit();
+    host.io = io;
+
+    var opened = try open(&eng, testing.allocator, bytes, &host, .{});
+    defer opened.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const sig = (try opened.resolveFuncSig(arena.allocator(), "test:m/m#f")).?;
+    try testing.expectEqual(@as(usize, 1), sig.params.len);
+    const map = sig.params[0].ty.map;
+    try testing.expectEqual(ctypes.PrimValType.string, map.key.prim);
+    try testing.expectEqual(ctypes.PrimValType.u32, map.value.prim);
+
+    var pairs = [_][2]ComponentValue{
+        .{ .{ .string = "a" }, .{ .u32 = 1 } },
+        .{ .{ .string = "bb" }, .{ .u32 = 20 } },
+        .{ .{ .string = "ccc" }, .{ .u32 = 300 } },
+    };
+    var items: [pairs.len]ComponentValue = undefined;
+    for (&pairs, &items) |*p, *item| item.* = .{ .tuple = p };
+    const out = (try opened.invokeTyped("test:m/m#f", &.{.{ .list = &items }}, testing.allocator)).?;
+    defer out.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 321), out.u32);
+}
+
+test "#612: an import / export carrying an implements attribute decodes under its plain name" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    for ([_][]const u8{ "test/component/implements_import_component.wasm", "test/component/implements_export_component.wasm" }, [_]bool{ true, false }) |path, is_import| {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, testing.allocator, .limited(1 << 20));
+        defer testing.allocator.free(bytes);
+
+        var comp = try decode.decode(testing.allocator, bytes);
+        defer comp.deinit(testing.allocator);
+        var info = try ctypes.decodeTypeInfo(testing.allocator, &comp);
+        defer info.deinit();
+        try cvalidate.validate(&info);
+        const found = if (is_import) for (info.imports.items) |imp| {
+            if (std.mem.eql(u8, imp.name, "cache")) break imp.desc == .instance;
+        } else false else for (info.exports.items) |ex| {
+            if (std.mem.eql(u8, ex.name, "cache")) break ex.sort == .instance;
+        } else false;
+        try testing.expect(found);
+
+        if (!is_import) continue;
+        // The host offers no `local:demo/store`: the import is unresolved.
+        var eng = try Engine.init(testing.allocator, .{});
+        defer eng.deinit();
+        var host = try wasi_host.Host.init(testing.allocator);
+        defer host.deinit();
+        host.io = io;
+        try testing.expectError(error.UnsupportedWasiImport, open(&eng, testing.allocator, bytes, &host, .{}));
+    }
+}
+
+test "REQ-1 (cw CM-API): a single-module component without a memory invokes its scalar export" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, "test/component/add_component.wasm", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+
+    var eng = try Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var host = try wasi_host.Host.init(testing.allocator);
+    defer host.deinit();
+    host.io = io;
+
+    var opened = try open(&eng, testing.allocator, bytes, &host, .{});
+    defer opened.deinit();
+    try testing.expect(opened == .single);
+    const out = (try opened.invokeTyped("add", &.{ .{ .u32 = 2 }, .{ .u32 = 3 } }, testing.allocator)).?;
+    try testing.expectEqual(@as(u32, 5), out.u32);
 }
 
 test "REQ-7 (cw CM-API): an opened component outlives the caller's input buffer" {
@@ -904,6 +984,26 @@ test "a lowered list result is allocated through the lower's own realloc, not ca
     try testing.expectEqual(@as(u32, 0), host.exit_code.?);
 }
 
+test "a component whose lowers name two different reallocs is refused at build" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, "test/component/wasi_p2_lower_realloc_conflict.wasm", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+
+    var eng = try Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var host = try wasi_host.Host.init(testing.allocator);
+    defer host.deinit();
+    host.io = io;
+
+    // One lower names the adapter's `cabi_import_realloc`, the other libc's
+    // `cabi_realloc`: one shared result allocator would serve one of them
+    // the wrong buffer, so the build fails instead.
+    try testing.expectError(error.UnsupportedLowerRealloc, runWasiP2Main(&eng, testing.allocator, bytes, &host, .{}));
+    try testing.expectEqual(@as(?u32, null), host.exit_code);
+}
+
 test "WASI random: a component calls insecure.get-insecure-random-bytes(16) — import resolves → exit 0" {
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
@@ -1095,6 +1195,69 @@ test "wasi:io/streams: blocking-write-and-flush with contents past the end of me
     try testing.expectError(error.OutOfBoundsLoad, runWasiP2Main(&eng, testing.allocator, bytes, &host, .{}));
 }
 
+test "wasi:io/poll: a poll whose result list's byte size does not fit in u32 traps as the store of that list" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, "test/component/poll_list_len_max.wasm", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+
+    var eng = try Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var host = try wasi_host.Host.init(testing.allocator);
+    defer host.deinit();
+    host.io = io;
+
+    try testing.expectError(error.OutOfBoundsStore, runWasiP2Main(&eng, testing.allocator, bytes, &host, .{}));
+}
+
+fn runWasiP2MainOnFixture(path: []const u8) !void {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+
+    var eng = try Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var host = try wasi_host.Host.init(testing.allocator);
+    defer host.deinit();
+    host.io = io;
+    try runWasiP2Main(&eng, testing.allocator, bytes, &host, .{});
+}
+
+test "the sync entry is wasi:cli/run's run by name, not the first lift (#622)" {
+    // `add` is lifted first; calling it with no arguments would fail.
+    try runWasiP2MainOnFixture("test/component/run_second_lift.wasm");
+}
+
+test "a component without a wasi:cli/run export has no sync entry, whatever it lifts (#622)" {
+    try testing.expectError(error.NoRunExport, runWasiP2MainOnFixture("test/component/add_component.wasm"));
+}
+
+test "an async entry is refused on the sync path, not run sync (#677)" {
+    try testing.expectError(error.AsyncEntryNeedsWasiP3, runWasiP2MainOnFixture("test/component/async_stdout_write_via_stream.wasm"));
+}
+
+test "wasi:filesystem: an open-at whose result payload's address does not fit in u32 traps as the store of that result" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, "test/component/open_at_retptr_max.wasm", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+
+    var eng = try Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var host = try wasi_host.Host.init(testing.allocator);
+    defer host.deinit();
+    host.io = io;
+    _ = try host.addPreopen(tmp.dir.handle, "/sandbox");
+
+    try testing.expectError(error.OutOfBoundsStore, runWasiP2Main(&eng, testing.allocator, bytes, &host, .{}));
+}
+
 test "E2: WASI-P2 cli/environment + terminal + check-write (a capture is not a terminal)" {
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
@@ -1138,7 +1301,7 @@ test "E2: get-terminal-stderr is some on a pty, and the handle drops (#507)" {
     var ptn: c_uint = 0;
     _ = try linuxOk(linux.ioctl(master, linux.T.IOCGPTN, @intFromPtr(&ptn)));
     var path_buf: [32]u8 = undefined;
-    const path = try std.fmt.bufPrintSentinel(&path_buf, "/dev/pts/{d}", .{ptn}, 0);
+    const path = try std.mem.printSentinel(&path_buf, "/dev/pts/{d}", .{ptn}, 0);
     const slave: i32 = @intCast(try linuxOk(linux.open(path, .{ .ACCMODE = .RDWR, .NOCTTY = true }, 0)));
     defer _ = linux.close(slave);
     const saved_stderr: i32 = @intCast(try linuxOk(linux.dup(2)));
@@ -1247,6 +1410,28 @@ test "0.2 metadata-hash + metadata-hash-at: the fd route and the path route give
     // (metadata-hash-at), and asserts the two metadata-hash-values are equal;
     // b.txt must hash differently and a missing path must be err(no-entry).
     // It traps on any mismatch, so a clean return proves all three.
+    try runWasiP2Main(&eng, testing.allocator, bytes, &host, .{});
+}
+
+test "0.2 descriptor.read: a read at offset 0 answers, and one ending past the i64 range is err(invalid)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, "test/component/wasi_p2_fs_read_offset.wasm", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+
+    var eng = try Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var host = try wasi_host.Host.init(testing.allocator);
+    defer host.deinit();
+    host.io = io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "hello" });
+    _ = try host.addPreopen(tmp.dir.handle, "/sandbox");
+
+    // The guest traps unless the read at 0 returns 5 bytes and the 1-byte
+    // reads at i64::MAX and u64::MAX each return err(invalid).
     try runWasiP2Main(&eng, testing.allocator, bytes, &host, .{});
 }
 
@@ -1529,11 +1714,11 @@ fn tcpEchoServerOnce(io: std.Io, server: *std.Io.net.Server) void {
     defer conn.close(io);
     var buf: [16]u8 = undefined;
     var bufs = [_][]u8{&buf};
-    const n = io.vtable.netRead(io.userdata, conn.socket.handle, &bufs) catch return;
+    const n = p2_sockets.netRead(io, conn.socket.handle, &bufs) catch return;
     var reply_buf: [32]u8 = undefined;
-    const reply = std.fmt.bufPrint(&reply_buf, "pong-{s}", .{buf[0..n]}) catch return;
+    const reply = std.mem.print(&reply_buf, "pong-{s}", .{buf[0..n]}) catch return;
     const data = [_][]const u8{reply};
-    _ = io.vtable.netWrite(io.userdata, conn.socket.handle, "", &data, 1) catch return;
+    _ = p2_sockets.netWrite(io, conn.socket.handle, &data) catch return;
 }
 
 test "ADR-0180: a real rust wasip2 TCP client connects + echoes through wasi:sockets" {
@@ -1549,7 +1734,7 @@ test "ADR-0180: a real rust wasip2 TCP client connects + echoes through wasi:soc
     var server = try listen_addr.listen(io, .{ .mode = .stream, .protocol = .tcp });
     defer server.deinit(io);
     var port_buf: [8]u8 = undefined;
-    const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{server.socket.address.getPort()});
+    const port_str = try std.mem.print(&port_buf, "{d}", .{server.socket.address.getPort()});
     var server_fut = try io.concurrent(tcpEchoServerOnce, .{ io, &server });
     defer server_fut.cancel(io);
 
@@ -1558,6 +1743,7 @@ test "ADR-0180: a real rust wasip2 TCP client connects + echoes through wasi:soc
     var host = try wasi_host.Host.init(testing.allocator);
     defer host.deinit();
     host.io = io;
+    host.allow_network = true;
     try host.setArgs(&.{ "tcp_echo", port_str });
     var capture: std.ArrayList(u8) = .empty;
     defer capture.deinit(testing.allocator);
@@ -1569,6 +1755,66 @@ test "ADR-0180: a real rust wasip2 TCP client connects + echoes through wasi:soc
     // ADR-0180 Phase-1 existence proof.
     try runWasiP2Main(&eng, testing.allocator, bytes, &host, .{});
     try testing.expectEqualStrings("got pong-ping\n", capture.items);
+}
+
+test "without the network grant, a rust wasip2 TCP connect is refused with access-denied" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, "test/component/wasi_p2_tcp_rust.wasm", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+
+    var eng = try Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var host = try wasi_host.Host.init(testing.allocator);
+    defer host.deinit();
+    host.io = io;
+    // Nothing listens on loopback port 1: a connect that got through would be
+    // refused by the peer, not denied.
+    try host.setArgs(&.{ "tcp_echo", "1" });
+    var stdout_cap: std.ArrayList(u8) = .empty;
+    defer stdout_cap.deinit(testing.allocator);
+    var stderr_cap: std.ArrayList(u8) = .empty;
+    defer stderr_cap.deinit(testing.allocator);
+    host.stdout_buffer = &stdout_cap;
+    host.stderr_buffer = &stderr_cap;
+
+    // Rust maps `error-code::access-denied` to `PermissionDenied`, and the
+    // guest's `expect("connect failed")` panics with it (an `unreachable` trap).
+    try testing.expectError(error.Unreachable, runWasiP2Main(&eng, testing.allocator, bytes, &host, .{}));
+    try testing.expectEqualStrings("", stdout_cap.items);
+    try testing.expect(std.mem.find(u8, stderr_cap.items, "connect failed") != null);
+    try testing.expect(std.mem.find(u8, stderr_cap.items, "PermissionDenied") != null);
+}
+
+test "a default build gates the WASI 0.3 connect and name lookup a sync export reaches" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, "test/component/wasi_p3_network_sync.wasm", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    const listen_addr: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(0) };
+    var server = try listen_addr.listen(io, .{ .mode = .stream, .protocol = .tcp });
+    defer server.deinit(io);
+    const port = server.socket.address.getPort();
+
+    var eng = try Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var host = try wasi_host.Host.init(testing.allocator);
+    defer host.deinit();
+    host.io = io;
+    var opened = try open(&eng, testing.allocator, bytes, &host, .{});
+    defer opened.deinit();
+
+    // Each export answers (disc << 8) | error-code: 0x100 = err(access-denied).
+    for ([_]bool{ false, true }) |granted| {
+        host.allow_network = granted;
+        const want: u32 = if (granted) 0 else 0x100;
+        const connected = (try opened.invokeTyped("connect", &.{.{ .u16 = port }}, testing.allocator)).?;
+        try testing.expectEqual(want, connected.u32);
+        const resolved = (try opened.invokeTyped("resolve", &.{}, testing.allocator)).?;
+        try testing.expectEqual(want, resolved.u32);
+    }
 }
 
 /// Host-side client for the listener e2e: retry-connect to the guest's
@@ -1584,13 +1830,13 @@ fn tcpClientOnce(io: std.Io, port: u16) void {
     } else return;
     defer stream.close(io);
     const data = [_][]const u8{"ping"};
-    _ = io.vtable.netWrite(io.userdata, stream.socket.handle, "", &data, 1) catch return;
+    _ = p2_sockets.netWrite(io, stream.socket.handle, &data) catch return;
     // Read until the guest's full "ping-ack" reply arrived (2 writes).
     var buf: [16]u8 = undefined;
     var total: usize = 0;
     while (total < 8) {
         var bufs = [_][]u8{buf[total..]};
-        const n = io.vtable.netRead(io.userdata, stream.socket.handle, &bufs) catch return;
+        const n = p2_sockets.netRead(io, stream.socket.handle, &bufs) catch return;
         if (n == 0) return;
         total += n;
     }
@@ -1610,7 +1856,7 @@ test "ADR-0180 Phase 2: a real rust wasip2 TCP listener accepts + echoes through
     const port = probe.socket.address.getPort();
     probe.deinit(io);
     var port_buf: [8]u8 = undefined;
-    const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+    const port_str = try std.mem.print(&port_buf, "{d}", .{port});
 
     var client_fut = try io.concurrent(tcpClientOnce, .{ io, port });
     defer client_fut.cancel(io);
@@ -1620,6 +1866,7 @@ test "ADR-0180 Phase 2: a real rust wasip2 TCP listener accepts + echoes through
     var host = try wasi_host.Host.init(testing.allocator);
     defer host.deinit();
     host.io = io;
+    host.allow_network = true;
     try host.setArgs(&.{ "tcp_listen", port_str });
     var capture: std.ArrayList(u8) = .empty;
     defer capture.deinit(testing.allocator);
@@ -1631,7 +1878,7 @@ test "ADR-0180 Phase 2: a real rust wasip2 TCP listener accepts + echoes through
     // -> echo "ping"+"-ack" — the ADR-0180 Phase-2 existence proof.
     try runWasiP2Main(&eng, testing.allocator, bytes, &host, .{});
     var expect_buf: [48]u8 = undefined;
-    const expected = try std.fmt.bufPrint(&expect_buf, "served ping on {d}\n", .{port});
+    const expected = try std.mem.print(&expect_buf, "served ping on {d}\n", .{port});
     try testing.expectEqualStrings(expected, capture.items);
 }
 
@@ -2103,7 +2350,7 @@ test "ADR-0205 A: official wasip3 binary decodes the async-support canon builtin
 
     // The wit-bindgen async runtime imports the full builtin set; decode must
     // surface each (previously Error.UnsupportedCanon killed the whole binary).
-    var seen = [_]bool{false} ** 6; // task_cancel, subtask_cancel, subtask_drop, ctx_get, ctx_set, ws_poll
+    var seen: [6]bool = @splat(false); // task_cancel, subtask_cancel, subtask_drop, ctx_get, ctx_set, ws_poll
     var async_lowers: usize = 0;
     for (info.canons.items) |c| switch (c) {
         .task_cancel => seen[0] = true,
